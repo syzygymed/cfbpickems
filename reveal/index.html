@@ -322,11 +322,16 @@ h1.slam,h2.slam{
   padding:12px 24px;background:rgba(10,20,27,.85);
 }
 
+/* Reduced motion: keep the full experience timeline; strip translate/scale so it's fades only */
+@keyframes fadeonly{to{opacity:1}}
+@keyframes tapfade{0%{opacity:.9}100%{opacity:0}}
 @media (prefers-reduced-motion: reduce){
-  .scene,.scene.active{transition:none;transform:none}
-  .rv,.active .rv{animation:none !important;opacity:1;transform:none}
-  #s-gate .pulse,#s-code .charge.show,.livepulse{animation:none}
-  .tapdot,.tapdot.go{animation:none;opacity:0}
+  .scene{transform:none}
+  .rv{transform:none}
+  .active .rv{animation-name:fadeonly}
+  .tapdot.go{animation-name:tapfade}
+  .chip.bump{animation:none}
+  #flash.zap{animation-duration:.25s}
 }
 </style>
 </head>
@@ -558,7 +563,6 @@ h1.slam,h2.slam{
 <script>
 (function(){
 "use strict";
-var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 function el(id){ return document.getElementById(id); }
 
 /* ===================== PAUSABLE CLOCK & TIMERS ===================== */
@@ -583,7 +587,6 @@ function PT(fn, delay){
 }
 function cancelTimers(){ activeTimers.slice().forEach(function(t){ t.cancel(); }); }
 function seq(steps){
-  if(reduced){ steps.forEach(function(s){ s[1](); }); return; }
   steps.forEach(function(s){ PT(s[1], s[0]); });
 }
 
@@ -702,7 +705,6 @@ function sizeCanvas(){
   cx.setTransform(dpr,0,0,dpr,0,0);
   cx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
   ecg.x = 0; ecg.prevY = null;
-  if(reduced && ecg.mode !== "off") drawStaticStrip();
 }
 window.addEventListener("resize", sizeCanvas);
 function g(p, c, w){ var d=(p-c)/w; return Math.exp(-d*d); }
@@ -721,7 +723,7 @@ function ecgColor(){ return ecg.mode==="flat" ? "#FF4D5A" : "#3CE882"; }
 var beatFlags = {};
 function drawECG(){
   requestAnimationFrame(drawECG);
-  if(ecg.mode==="off" || reduced || paused) return;
+  if(ecg.mode==="off" || paused) return;
   var w = cv.clientWidth, h = cv.clientHeight, mid = h*0.6;
   var speed = 2.4;
   var now = vnow()/1000;
@@ -759,20 +761,6 @@ function ecgSet(mode, rate){
   ecg.mode = mode;
   if(rate) ecg.rate = rate;
   if(toSinus){ ecg.t0 = vnow()/1000; ecg.lastPhase = 0; beatFlags = {}; }
-  if(reduced) drawStaticStrip();
-}
-function drawStaticStrip(){
-  var w = cv.clientWidth, h = cv.clientHeight, mid = h*0.6;
-  cx.clearRect(0,0,w,h);
-  cx.strokeStyle = ecgColor(); cx.lineWidth = 2;
-  cx.beginPath();
-  for(var x=0;x<w;x++){
-    var y = mid;
-    if(ecg.mode==="sinus") y = mid - sinusY((x % 140)/140);
-    else if(ecg.mode==="vfib") y = mid - vfibY(x/60);
-    if(x===0) cx.moveTo(x,y); else cx.lineTo(x,y);
-  }
-  cx.stroke();
 }
 var beepScenes = { "s-code":1, "s-scribe":1 };
 function onBeat(){ if(beepScenes[scenes[idx].id]) beep(); }
@@ -796,7 +784,6 @@ function paintDots(){
 }
 
 function ripple(id){
-  if(reduced) return;
   var d = el(id);
   d.classList.remove("go");
   void d.offsetWidth;
@@ -913,10 +900,6 @@ var LINES = [
 function typeTerminal(){
   var term = el("term");
   term.innerHTML = "";
-  if(reduced){
-    term.innerHTML = LINES.map(function(l){ return '<div class="ln">'+l+'</div>'; }).join("");
-    return;
-  }
   var li = 0, ci = 0;
   var lineEl = document.createElement("div"); lineEl.className = "ln";
   var caret = document.createElement("span"); caret.className = "caret";
