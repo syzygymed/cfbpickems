@@ -35,6 +35,7 @@ const KEYS = {
   REJECTED_SUGG: 'cfbp_rejected_suggestions',  // per-week dismissed suggested games
   REACTIONS:   'cfbp_reactions',                // per-week game emoji reactions
   FEEDBACK:    'cfbp_feedback',                 // user-submitted feature requests / issues
+  COMMENTS:    'cfbp_comments',                 // per-game + general chat messages (with PickEms Bot)
   ACTIVE_WEEK: 'cfbp_active_week',
   FETCH_PROOF: 'cfbp_fetch_proof',
   SITE_UNLOCK: SITE_PIN_KEY,  // 'cfbp_site_unlocked'
@@ -99,6 +100,7 @@ export function ensureSeedData() {
   if(!load(KEYS.REJECTED_SUGG)) save(KEYS.REJECTED_SUGG, {});
   if(!load(KEYS.REACTIONS))   save(KEYS.REACTIONS,   {});
   if(!load(KEYS.FEEDBACK))    save(KEYS.FEEDBACK,    []);
+  if(!load(KEYS.COMMENTS))    save(KEYS.COMMENTS,    []);
   if(!load(KEYS.ACTIVE_WEEK)) save(KEYS.ACTIVE_WEEK, REAL_WEEK_1_2026.weekId);
 }
 
@@ -117,6 +119,7 @@ export function resetToDemo() {
   save(KEYS.REJECTED_SUGG, {});
   save(KEYS.REACTIONS, {});
   save(KEYS.FEEDBACK, []);
+  save(KEYS.COMMENTS, []);
   save(KEYS.ACTIVE_WEEK, REAL_WEEK_1_2026.weekId);
   save(KEYS.FETCH_PROOF, null);
   clearSession();
@@ -468,6 +471,89 @@ export function appendFeedback(entry) {
   save(KEYS.FEEDBACK, all);
 }
 export function clearFeedback() { save(KEYS.FEEDBACK, []); }
+
+// ─── COMMENTS / CHAT ─────────────────────────────────────────────────────────
+// Per-game comments + general chat + PickEms Bot posts all live in one list.
+// Each entry:
+//   {
+//     commentId: 'c_<timestamp>_<rand>',
+//     weekId:    string,
+//     gameId:    string | null,   // null = general chat (not tied to a game)
+//     authorId:  string,          // playerId, or the literal 'bot' for PickEms Bot
+//     authorKind:'player' | 'bot',
+//     body:      string,          // trimmed, max 200 chars for players; bot can go slightly longer
+//     createdAt: ISO string,
+//   }
+//
+// One list scales well for a small league across a full season (a few hundred
+// entries max). If it ever grows too large we can shard by weekId later.
+
+const COMMENT_MAX_LEN = 200;
+
+/** Get all comments across the app. */
+export function getComments() { return load(KEYS.COMMENTS) || []; }
+
+/** Get comments for a specific game, oldest-first. */
+export function getGameComments(gameId) {
+  return getComments()
+    .filter(c => c.gameId === gameId)
+    .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+
+/**
+ * Add a new comment. Returns the created entry on success or null on rejection.
+ * body is trimmed and capped to COMMENT_MAX_LEN chars. If body is empty after
+ * trimming, no entry is created (nothing to say = don't spam the log).
+ */
+export function addComment({ weekId, gameId, authorId, authorKind = 'player', body }) {
+  const trimmed = (body || '').trim().slice(0, COMMENT_MAX_LEN);
+  if (!trimmed) return null;
+  const entry = {
+    commentId: `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    weekId: weekId || null,
+    gameId: gameId || null,
+    authorId: authorId || 'unknown',
+    authorKind,
+    body: trimmed,
+    createdAt: new Date().toISOString(),
+  };
+  const all = getComments();
+  all.push(entry);
+  save(KEYS.COMMENTS, all);
+  return entry;
+}
+
+/** Remove a comment (used when a player deletes their own or admin moderates). */
+export function deleteComment(commentId) {
+  save(KEYS.COMMENTS, getComments().filter(c => c.commentId !== commentId));
+}
+
+/**
+ * Idempotent bot post. Bot messages are typically triggered by observable
+ * events (game finalized, week finalized, new leader) — this dedupe helper
+ * ensures a given `eventKey` only produces ONE bot post no matter how many
+ * times the trigger fires. Returns true if the post was actually added.
+ */
+export function addBotPostIfNew({ eventKey, weekId, gameId, body }) {
+  const existing = getComments().some(c =>
+    c.authorKind === 'bot' && c.botEventKey === eventKey
+  );
+  if (existing) return false;
+  const entry = {
+    commentId: `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    weekId: weekId || null,
+    gameId: gameId || null,
+    authorId: 'bot',
+    authorKind: 'bot',
+    botEventKey: eventKey,
+    body: (body || '').trim().slice(0, 400), // bot allowed slightly longer
+    createdAt: new Date().toISOString(),
+  };
+  const all = getComments();
+  all.push(entry);
+  save(KEYS.COMMENTS, all);
+  return true;
+}
 
 // ─── PICKS ────────────────────────────────────────────────────────────────────
 

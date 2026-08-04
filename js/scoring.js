@@ -36,25 +36,47 @@ export function pointsForResult(result) {
   return result===PICK_RESULT.WIN ? 1 : 0;
 }
 
+/**
+ * Read a game's scoring multiplier. Defaults to 1 (no-op) so pre-multiplier
+ * data continues to behave identically. Any non-finite/negative value is
+ * defensively coerced to 1 so a bad edit can't poison standings.
+ */
+export function gameMultiplier(game) {
+  const m = Number(game?.multiplier);
+  if (!Number.isFinite(m) || m <= 0) return 1;
+  return m;
+}
+
 export function calculateWeeklyResults(weekId, players, picks, games, actualTiebreaker=null) {
   const results = players.map(player => {
     const pp = picks.filter(p=>p.weekId===weekId&&p.playerId===player.playerId);
-    let correct=0, incorrect=0, noDecisions=0, pending=0;
+    // Two parallel tallies:
+    //   correctPicks / incorrectPicks  — WEIGHTED (respects game.multiplier)
+    //   correctCount / incorrectCount  — RAW (unweighted counts, for math-audit)
+    // Weighted values drive rankings and standings so multiplier games actually
+    // "matter more". Raw counts stay available for CSV export + the season
+    // audit tooling so a 2x game doesn't look like a math error.
+    let correct=0, incorrect=0, correctCount=0, incorrectCount=0, noDecisions=0, pending=0;
     for (const pick of pp) {
       const game=games.find(g=>g.gameId===pick.gameId);
       if(!game) continue;
       const r=evaluatePick(pick,game);
-      if(r===PICK_RESULT.WIN) correct++;
-      else if(r===PICK_RESULT.LOSS) incorrect++;
+      const mult = gameMultiplier(game);
+      if(r===PICK_RESULT.WIN)            { correct += mult;   correctCount++; }
+      else if(r===PICK_RESULT.LOSS)      { incorrect += mult; incorrectCount++; }
       else if(r===PICK_RESULT.NO_DECISION) noDecisions++;
       else pending++;
     }
     const tbGuess = getTiebreakerGuess(weekId, player.playerId);
+    // Tiebreaker is a raw numeric guess and MUST NOT be scaled by any multiplier
+    // (it's used only to break ties in the standings, not as a scoring input).
     const tbDelta = (actualTiebreaker!==null&&tbGuess!==null) ? Math.abs(tbGuess-actualTiebreaker) : null;
     return {
       resultId:`wr_${weekId}_${player.playerId}`,
       weekId, playerId:player.playerId, displayName:player.displayName,
-      correctPicks:correct, incorrectPicks:incorrect, noDecisions, pending,
+      correctPicks:correct, incorrectPicks:incorrect,
+      correctCount, incorrectCount,
+      noDecisions, pending,
       tiebreakerGuess:tbGuess, tiebreakerDelta:tbDelta,
       rank:0, isWinner:false, isLoser:false, wonByTiebreaker:false,
     };
@@ -102,14 +124,29 @@ export function calculateAlmaMaterTotal(games, almaMaters, calcMode='selectedSla
 export function calculateSeasonStandings(players, allWeeklyResults) {
   const standings=players.map(player=>{
     const pr=allWeeklyResults.filter(r=>r.playerId===player.playerId);
+    // WEIGHTED totals drive ranking. These are the numbers players compare on.
     const totalCorrect=pr.reduce((s,r)=>s+(r.correctPicks||0),0);
     const totalIncorrect=pr.reduce((s,r)=>s+(r.incorrectPicks||0),0);
+    // RAW counts preserved for the season audit tooling. They fall back to the
+    // weighted values when older weekly results (pre-multiplier) don't carry
+    // the count fields — safe default because no multipliers existed then.
+    const totalCorrectCount=pr.reduce((s,r)=>s+(r.correctCount ?? r.correctPicks ?? 0),0);
+    const totalIncorrectCount=pr.reduce((s,r)=>s+(r.incorrectCount ?? r.incorrectPicks ?? 0),0);
     const totalND=pr.reduce((s,r)=>s+(r.noDecisions||0),0);
     const weeklyWins=pr.filter(r=>r.isWinner).length;
     const weeklyLosses=pr.filter(r=>r.isLoser).length;
-    const totalGames=totalCorrect+totalIncorrect+totalND;
-    const winPct=totalGames>0?Math.round((totalCorrect/totalGames)*1000)/10:0;
-    return{playerId:player.playerId,displayName:player.displayName,totalCorrect,totalIncorrect,totalND,weeklyWins,weeklyLosses,winPct,currentRank:0,isSeasonLeader:false,isCurrentLastPlace:false};
+    const totalGames=totalCorrectCount+totalIncorrectCount+totalND;
+    // Win % uses raw counts — otherwise a 2x game skews the ratio in a
+    // misleading way ("83% win rate" when they got 5 of 6 raw games right
+    // but the 6th was a 2x loss).
+    const winPct=totalGames>0?Math.round((totalCorrectCount/totalGames)*1000)/10:0;
+    return{
+      playerId:player.playerId, displayName:player.displayName,
+      totalCorrect, totalIncorrect,
+      totalCorrectCount, totalIncorrectCount,
+      totalND, weeklyWins, weeklyLosses, winPct,
+      currentRank:0, isSeasonLeader:false, isCurrentLastPlace:false,
+    };
   });
   standings.sort((a,b)=>b.totalCorrect-a.totalCorrect||b.winPct-a.winPct);
   standings.forEach((s,i)=>{s.currentRank=i+1;});

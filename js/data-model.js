@@ -383,6 +383,29 @@ export function createWeek(season, weekNumber, startDate='', endDate='') {
   };
 }
 
+// ─── ESPN MULTI-SPORT ENDPOINTS ──────────────────────────────────────────────
+// Base path map for ESPN's public scoreboard API. Same shape for every sport,
+// so one polling routine can serve CFB + NFL (and easily extend).
+// Doc reference: site.api.espn.com/apis/site/v2/sports/<sport>/<league>/scoreboard
+export const ESPN_SPORT_ENDPOINTS = {
+  'college-football': {
+    label: 'College Football',
+    path: 'football/college-football',
+    // A CFB event ID is what the existing pipeline uses; nothing new to do here.
+  },
+  'nfl': {
+    label: 'NFL',
+    path: 'football/nfl',
+  },
+  // Extend by adding more entries as needed — the fetcher is generic.
+};
+
+/** Resolve the ESPN base path for a game's sport, defaulting to CFB. */
+export function espnSportPath(sportKey) {
+  const s = ESPN_SPORT_ENDPOINTS[sportKey || 'college-football'];
+  return s ? s.path : ESPN_SPORT_ENDPOINTS['college-football'].path;
+}
+
 export function createGame(weekId, overrides={}) {
   return {
     gameId:`g_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
@@ -403,6 +426,25 @@ export function createGame(weekId, overrides={}) {
     status:'scheduled', actualWinner:null, atsWinner:null,
     isAlmaMaterGame:false,
     venue:null, venueDisplay:null, neutralSite:false,
+    // Scoring multiplier — default 1.0 keeps behavior identical to pre-multiplier
+    // weeks. Commissioner sets 2 (or 1.5, 3, etc.) for marquee/rivalry/playoff
+    // games. Wins AND losses scale equally by this factor so a 2x game gives
+    // +2 or -2 in the standings math. Tiebreakers are NOT multiplied — they
+    // remain a separate numeric guess used only for tiebreaks.
+    multiplier: 1,
+    // Manual / out-of-league game flag. When true the game is NOT part of the
+    // normal ESPN CFB pipeline — it's an ad-hoc pick the commissioner added
+    // (e.g. NFL Thanksgiving). Manual games still flow through the SAME
+    // scoring pipeline as CFB games (multiplier, spread, results) — the flag
+    // just controls UI cues (league chip, ESPN link visibility, refresh sport).
+    isManual: false,
+    leagueLabel: '',      // e.g. "NFL", "Special", "Thanksgiving" — shown as a small chip
+    // Multi-sport ESPN linking for manual games. When espnEventId + espnSport
+    // are both set on a manual game, the auto-refresh pipeline queries the
+    // matching ESPN scoreboard so live scores update the same way they do for
+    // CFB. Values are the string keys used by `ESPN_SPORT_ENDPOINTS` below.
+    // Unset → the game stays fully manual (commissioner types scores).
+    espnSport: null,      // 'nfl' | 'college-football' | null
     lastUpdated:null,
     createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(),
     ...overrides,

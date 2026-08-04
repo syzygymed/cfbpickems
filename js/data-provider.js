@@ -14,9 +14,10 @@
  *  - Multi-day fetchByDateRange merging
  */
 
-import { ALMA_MATERS, TIME_WINDOW, GAME_STATUS, DATA_QUALITY, DATA_SOURCE_MODE, createGame, getAlmaMaterMatch } from './data-model.js';
+import { ALMA_MATERS, TIME_WINDOW, GAME_STATUS, DATA_QUALITY, DATA_SOURCE_MODE, createGame, getAlmaMaterMatch, ESPN_SPORT_ENDPOINTS, espnSportPath } from './data-model.js';
 
-const ESPN_CFB = 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard';
+const ESPN_API_ROOT = 'https://site.api.espn.com/apis/site/v2/sports';
+const ESPN_CFB = `${ESPN_API_ROOT}/football/college-football/scoreboard`;
 
 const CORS_FALLBACKS = [
   url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
@@ -41,12 +42,24 @@ const _state = {
 
 /**
  * Build the raw ESPN scoreboard URL (no proxy).
+ *
+ * `params.sport` (optional) — one of the keys in ESPN_SPORT_ENDPOINTS
+ *   ('college-football', 'nfl'). Defaults to college-football to preserve
+ *   backward compatibility with the pre-multi-sport call sites.
+ *
+ * The `groups=80` parameter is CFB-specific (FBS division filter) so we only
+ * pass it when the sport is college-football. NFL and other sports don't use
+ * groups and would return unexpected results if we sent it.
+ *
  * Shown in Commissioner panel for transparency.
  */
 export function buildEspnUrl(params = {}) {
-  const p = { groups: '80', limit: '200', ...params };
+  const { sport = 'college-football', ...rest } = params;
+  const path = espnSportPath(sport);
+  const isCfb = sport === 'college-football';
+  const p = { ...(isCfb ? { groups: '80' } : {}), limit: '200', ...rest };
   const qs = new URLSearchParams(p).toString();
-  return ESPN_CFB + (qs ? '?' + qs : '');
+  return `${ESPN_API_ROOT}/${path}/scoreboard${qs ? '?' + qs : ''}`;
 }
 
 // ─── PUBLIC: FETCH ENTRY POINTS ───────────────────────────────────────────────
@@ -128,27 +141,57 @@ export async function fetchCurrentCFBGames() {
   return resilientFetch(espnUrl);
 }
 
+/**
+ * Refresh live scores for a set of stored games. Each game may point at a
+ * different ESPN sport (CFB, NFL, etc.) via its `espnSport` field. We bucket
+ * games by sport, fetch each sport's scoreboard once, and merge results.
+ *
+ * Games without an `espnSport` are treated as CFB (default) so the pre-manual
+ * codebase keeps working unchanged.
+ *
+ * The signature is kept the same as before — `(espnEventIds, storedGames)` —
+ * so all existing call sites work. `storedGames` is what we actually use to
+ * bucket by sport; `espnEventIds` is retained for historical compatibility
+ * but is not required.
+ */
 export async function refreshScoresByEventIds(espnEventIds = [], storedGames = []) {
-  const espnUrl = buildEspnUrl({});
-  const result  = await resilientFetch(espnUrl);
-  if (!result.games?.length) {
-    return { updated: [], errors: result.error ? [result.error] : [], timestamp: new Date().toISOString() };
+  // Bucket games by sport (default cfb)
+  const bySport = new Map();
+  for (const g of storedGames) {
+    if (!g?.espnEventId) continue;
+    const sport = g.espnSport || 'college-football';
+    if (!bySport.has(sport)) bySport.set(sport, []);
+    bySport.get(sport).push(g);
   }
+  // Fetch each sport's scoreboard in parallel
+  const fetches = [...bySport.keys()].map(async sport => {
+    const url = buildEspnUrl({ sport });
+    const result = await resilientFetch(url);
+    return { sport, result };
+  });
+  const settled = await Promise.all(fetches);
+
   const updated = [];
-  for (const liveGame of result.games) {
-    const stored = storedGames.find(g =>
-      g.espnEventId && String(g.espnEventId) === String(liveGame.espnEventId)
-    );
-    if (!stored) continue;
-    updated.push({
-      gameId: stored.gameId, espnEventId: liveGame.espnEventId,
-      homeScore: liveGame.homeScore, awayScore: liveGame.awayScore,
-      status: liveGame.status, actualWinner: liveGame.actualWinner,
-      lastUpdated: new Date().toISOString(),
-    });
+  const errors = [];
+  for (const { sport, result } of settled) {
+    if (result.error) { errors.push(`${sport}: ${result.error}`); continue; }
+    if (!result.games?.length) continue;
+    const gamesInSport = bySport.get(sport) || [];
+    for (const liveGame of result.games) {
+      const stored = gamesInSport.find(g =>
+        String(g.espnEventId) === String(liveGame.espnEventId)
+      );
+      if (!stored) continue;
+      updated.push({
+        gameId: stored.gameId, espnEventId: liveGame.espnEventId,
+        homeScore: liveGame.homeScore, awayScore: liveGame.awayScore,
+        status: liveGame.status, actualWinner: liveGame.actualWinner,
+        lastUpdated: new Date().toISOString(),
+      });
+    }
   }
   _state.lastScoreRefresh = new Date().toISOString();
-  return { updated, errors: [], timestamp: _state.lastScoreRefresh };
+  return { updated, errors, timestamp: _state.lastScoreRefresh };
 }
 
 export function getProviderState() { return { ..._state }; }

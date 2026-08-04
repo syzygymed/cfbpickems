@@ -9,10 +9,10 @@
  *   - Guard against caching chrome-extension://, moz-extension://, devtools://
  *     and other unsupported schemes (silences the "Request scheme … unsupported"
  *     console error from extension-injected fetches).
- *   - Bumped CACHE_NAME → cfb-pickems-v15-2 to invalidate any v9 cached files.
+ *   - Bumped CACHE_NAME → cfb-pickems-v15-3 to invalidate any v9 cached files.
  */
 
-const CACHE_NAME = 'cfb-pickems-v15-2';
+const CACHE_NAME = 'cfb-pickems-v15-3';
 
 const STATIC_ASSETS = [
   './',

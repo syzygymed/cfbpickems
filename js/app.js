@@ -4,8 +4,8 @@
  * One-stop place to update the user-visible version string + release date.
  * Surfaced in the footer of the Rules tab (Priority 12).
  */
-export const APP_VERSION = 'v0.15.2';
-export const APP_VERSION_DATE = '2026-06-04';
+export const APP_VERSION = 'v0.15.3';
+export const APP_VERSION_DATE = '2026-06-08';
 
 
 import {
@@ -40,6 +40,7 @@ import {
   getRejectedSuggestions, rejectSuggestion, unrejectSuggestion,
   clearRejectedSuggestions, isSuggestionRejected, suggestionKeyOf,
   getReactionsForGame, toggleReaction,
+  getComments, getGameComments, addComment, deleteComment, addBotPostIfNew,
   getFeedback, appendFeedback,
   countPicksForGame, deletePicksForGame,
   saveFetchProof, getFetchProof,
@@ -693,6 +694,7 @@ function renderGameCard(game, pickedTeam, result, isLocked, showResult) {
       <div class="flex gap-sm flex-center">
         <span class="game-time">${timeStr}</span>
         ${game.isAlmaMaterGame?'<span class="alma-mater-badge">⭐ Alma Mater</span>':''}
+        ${renderGameBadges(game)}
         ${dqBadge}
       </div>
       <div class="flex gap-sm flex-center">
@@ -1023,7 +1025,7 @@ function renderDashboard() {
     });
   });
   // Wire up reaction chips + "+" pickers in whichever view is rendered
-  bindReactionHandlers(players);
+  bindReactionHandlers(players); bindCommentBubbleHandlers();
   // Priority 7: column reorder (drag-and-drop) for both matrix and compact.
   bindColumnReorderHandlers();
   document.getElementById('manual-refresh-btn')?.addEventListener('click',async()=>{
@@ -1279,16 +1281,17 @@ function renderDashboardTable(players,games,allPicks,weeklyResults,weekId,actual
 
     return`<tr>
       <td class="game-info-cell">
-        <div class="game-info-matchup">${escHtml(matchupBare(game))}</div>
+        <div class="game-info-matchup">${escHtml(matchupBare(game))} ${renderGameBadges(game)}</div>
         <div class="game-info-meta">
           <span class="spread-badge-sm">${spreadStr}</span>
           ${statusInfo}
           ${ats?`<span style="font-size:.68rem;color:var(--maroon)">ATS: ${escHtml(atsLabel)}</span>`:''}
           ${game.espnEventId
-            ? `<a class="espn-link" href="https://www.espn.com/college-football/game/_/gameId/${encodeURIComponent(game.espnEventId)}" target="_blank" rel="noopener noreferrer" title="Open ESPN gamecast in a new tab">ESPN ↗</a>`
+            ? `<a class="espn-link" href="https://www.espn.com/${game.isManual && game.espnSport ? escHtml(game.espnSport) : 'college-football'}/game/_/gameId/${encodeURIComponent(game.espnEventId)}" target="_blank" rel="noopener noreferrer" title="Open ESPN gamecast in a new tab">ESPN ↗</a>`
             : ''}
         </div>
         ${renderReactionStrip(weekId, game.gameId, players)}
+        ${renderCommentBubble(weekId, game)}
       </td>${pickCells}
     </tr>`;
   }).join('');
@@ -1372,7 +1375,7 @@ function refreshReactionStrip(weekId, gameId, players) {
     if (tmp.firstElementChild) node.replaceWith(tmp.firstElementChild);
   });
   // Re-bind handlers for the (re-rendered) strip.
-  bindReactionHandlers(players);
+  bindReactionHandlers(players); bindCommentBubbleHandlers();
 }
 
 /**
@@ -1422,6 +1425,174 @@ function bindReactionHandlers(players) {
     });
   });
 }
+
+// ─── PER-GAME COMMENTS ────────────────────────────────────────────────────────
+// A small speech-bubble icon on each game row. Empty by default (outlined
+// bubble, faded); when comments exist, filled bubble + count badge. Tap opens
+// a lightweight modal thread. Both matrix and compact use the same renderer.
+
+const COMMENT_MAX_LEN = 200; // MUST match storage.js — updating here won't help save
+
+/**
+ * Small speech-bubble icon for a game row. Non-obtrusive by default so it
+ * doesn't compete with the pick matrix or spread/live colors. Rendered inline
+ * so it can slot into existing meta rows without wrapping.
+ */
+function renderCommentBubble(weekId, game) {
+  const count = getGameComments(game.gameId).length;
+  const hasAny = count > 0;
+  return `<button type="button" class="comment-bubble${hasAny?' has-comments':''}"
+    data-comment-week="${escHtml(weekId)}" data-comment-game="${escHtml(game.gameId)}"
+    title="${hasAny?`${count} comment${count>1?'s':''} on this game`:'Add a comment'}">
+    <span class="cb-icon" aria-hidden="true">💬</span>
+    ${hasAny?`<span class="cb-count">${count}</span>`:''}
+  </button>`;
+}
+
+/**
+ * Open the per-game comment thread modal. Renders a lightweight list of
+ * existing comments + an input at the bottom for a new comment. Reuses the
+ * modal-overlay pattern already in the app for consistency.
+ */
+function openCommentThreadModal(weekId, gameId) {
+  const game = getGame(gameId);
+  if (!game) return;
+  const session = getSession();
+  const players = getPlayers();
+  const playerLookup = Object.fromEntries(players.map(p => [p.playerId, p]));
+
+  const ov = document.createElement('div');
+  ov.className = 'modal-overlay centered comment-modal-overlay';
+  ov.setAttribute('data-comment-modal', gameId);
+
+  const renderThread = () => {
+    const comments = getGameComments(gameId);
+    if (!comments.length) {
+      return `<p class="text-muted text-sm text-center" style="padding:24px 8px">
+        No comments yet. Say something ${session?.playerId ? '👇' : '(log in as a player first)'}.
+      </p>`;
+    }
+    return comments.map(c => {
+      const isBot = c.authorKind === 'bot';
+      const author = isBot ? 'PickEms Bot' : (playerLookup[c.authorId]?.displayName || 'Unknown');
+      const initials = isBot ? '🤖' : escHtml(getPlayerInitials(playerLookup[c.authorId] || { displayName: author }));
+      const canDelete = !isBot && (session?.isAdmin || session?.playerId === c.authorId);
+      const ts = new Date(c.createdAt);
+      const timeStr = ts.toLocaleString(undefined, { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+      return `<div class="comment-item${isBot?' comment-item-bot':''}">
+        <div class="comment-avatar">${initials}</div>
+        <div class="comment-body">
+          <div class="comment-head">
+            <span class="comment-author">${escHtml(author)}${isBot?' <span class="bot-tag">BOT</span>':''}</span>
+            <span class="comment-time">${escHtml(timeStr)}</span>
+            ${canDelete?`<button class="comment-delete" data-comment-id="${escHtml(c.commentId)}" title="Delete">✕</button>`:''}
+          </div>
+          <div class="comment-text">${escHtml(c.body)}</div>
+        </div>
+      </div>`;
+    }).join('');
+  };
+
+  ov.innerHTML = `<div class="modal comment-modal">
+    <div class="modal-header">
+      <h3>💬 ${escHtml(matchupBare(game))}</h3>
+      <button class="modal-close" id="cm-close">✕</button>
+    </div>
+    <div class="comment-thread" id="cm-thread">${renderThread()}</div>
+    ${session?.playerId ? `
+      <div class="comment-input-row">
+        <textarea class="form-input comment-input" id="cm-input" rows="2"
+          maxlength="${COMMENT_MAX_LEN}"
+          placeholder="Talk your talk (max ${COMMENT_MAX_LEN} chars)"></textarea>
+        <button class="btn btn-primary" id="cm-post">Post</button>
+      </div>
+    ` : `
+      <p class="text-muted text-xs text-center" style="padding:8px 0">
+        Log in as a player from the Picks tab to comment.
+      </p>
+    `}
+  </div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#cm-close')?.addEventListener('click', () => ov.remove());
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+
+  const refreshThread = () => {
+    const t = ov.querySelector('#cm-thread');
+    if (t) t.innerHTML = renderThread();
+    bindThreadDeleteHandlers();
+    // Also refresh the underlying bubble count on the dashboard so the caller
+    // sees the new count without a full re-render.
+    refreshCommentBubbles(gameId);
+    // Auto-scroll to bottom
+    if (t) t.scrollTop = t.scrollHeight;
+  };
+
+  const bindThreadDeleteHandlers = () => {
+    ov.querySelectorAll('.comment-delete').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (!confirm('Delete this comment?')) return;
+        deleteComment(btn.dataset.commentId);
+        refreshThread();
+      });
+    });
+  };
+  bindThreadDeleteHandlers();
+  refreshThread(); // scroll to bottom on open
+
+  ov.querySelector('#cm-post')?.addEventListener('click', () => {
+    const input = ov.querySelector('#cm-input');
+    if (!input) return;
+    const body = input.value;
+    const entry = addComment({
+      weekId, gameId, authorId: session.playerId, authorKind: 'player', body,
+    });
+    if (!entry) { showToast('Enter something to post','warning'); return; }
+    input.value = '';
+    refreshThread();
+  });
+  ov.querySelector('#cm-input')?.addEventListener('keydown', e => {
+    // Cmd/Ctrl+Enter posts
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      ov.querySelector('#cm-post')?.click();
+    }
+  });
+}
+
+/**
+ * Re-render the bubble count for one game on every dashboard row/card without
+ * touching the rest of the dashboard. Called after posting/deleting a comment.
+ */
+function refreshCommentBubbles(gameId) {
+  const count = getGameComments(gameId).length;
+  document.querySelectorAll(`.comment-bubble[data-comment-game="${gameId}"]`).forEach(el => {
+    if (count > 0) {
+      el.classList.add('has-comments');
+      const existing = el.querySelector('.cb-count');
+      if (existing) existing.textContent = count;
+      else el.insertAdjacentHTML('beforeend', `<span class="cb-count">${count}</span>`);
+      el.title = `${count} comment${count>1?'s':''} on this game`;
+    } else {
+      el.classList.remove('has-comments');
+      el.querySelector('.cb-count')?.remove();
+      el.title = 'Add a comment';
+    }
+  });
+}
+
+/** Wire click handlers on every rendered comment bubble. Idempotent. */
+function bindCommentBubbleHandlers() {
+  document.querySelectorAll('.comment-bubble').forEach(btn => {
+    if (btn._commentWired) return; btn._commentWired = true;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const weekId = btn.dataset.commentWeek;
+      const gameId = btn.dataset.commentGame;
+      openCommentThreadModal(weekId, gameId);
+    });
+  });
+}
+
 
 /**
  * Compact alternative to the wide matrix above — optimized for narrow phone
@@ -1503,15 +1674,16 @@ function renderDashboardCompact(players, games, allPicks, weeklyResults, weekId,
     }).join('');
 
     const espn = game.espnEventId
-      ? ` · <a class="espn-link" href="https://www.espn.com/college-football/game/_/gameId/${encodeURIComponent(game.espnEventId)}" target="_blank" rel="noopener noreferrer">ESPN ↗</a>`
+      ? ` · <a class="espn-link" href="https://www.espn.com/${game.isManual && game.espnSport ? escHtml(game.espnSport) : 'college-football'}/game/_/gameId/${encodeURIComponent(game.espnEventId)}" target="_blank" rel="noopener noreferrer">ESPN ↗</a>`
       : '';
     return `<div class="dc-game">
       <div class="dc-game-head">
-        <div class="dc-matchup">${escHtml(matchupBare(game))}</div>
+        <div class="dc-matchup">${escHtml(matchupBare(game))} ${renderGameBadges(game)}</div>
         <div class="dc-meta"><span class="spread-badge-sm">${escHtml(spreadStr)}</span>${statusInfo}${espn}</div>
       </div>
       <div class="dc-chips">${chips}</div>
       ${renderReactionStrip(weekId, game.gameId, players)}
+      ${renderCommentBubble(weekId, game)}
     </div>`;
   }).join('');
 
@@ -3762,23 +3934,31 @@ function showGameModal(game, week, onSave) {
       else if (game.spread > 0) initFav = game.awayTeam || '';
     }
   }
+  const initMultiplier = Number(game?.multiplier) > 0 ? Number(game.multiplier) : 1;
+  const initIsManual = !!game?.isManual;
+  const initLeagueLabel = game?.leagueLabel || '';
+  const initEspnSport = game?.espnSport || '';
+  const initEspnEventId = game?.espnEventId || '';
+  // Editing a game whose status has already advanced past 'scheduled' is
+  // risky for the multiplier — it retroactively changes standings. We track
+  // the original value so save() can prompt for confirmation.
+  const originalMultiplier = initMultiplier;
+  const gameHasScored = game && game.status && game.status !== 'scheduled';
+
   ov.innerHTML=`<div class="modal">
     <div class="modal-header"><h3>${game?'Edit Game':'Add Game'}</h3><button class="modal-close" id="mc">✕</button></div>
     <div class="flex gap-sm">
-      <div class="form-group" style="flex:2"><label class="form-label">Home Team (School)</label><input class="form-input" id="m-home" value="${escHtml(game?.homeTeam||'')}" placeholder="e.g. Oklahoma" /></div>
+      <div class="form-group" style="flex:2"><label class="form-label">Home Team</label><input class="form-input" id="m-home" value="${escHtml(game?.homeTeam||'')}" placeholder="e.g. Oklahoma" /></div>
       <div class="form-group" style="flex:1"><label class="form-label">Home Mascot</label><input class="form-input" id="m-home-mascot" value="${escHtml(game?.homeMascot||'')}" placeholder="Sooners" /></div>
     </div>
     <div class="flex gap-sm">
-      <div class="form-group" style="flex:2"><label class="form-label">Away Team (School)</label><input class="form-input" id="m-away" value="${escHtml(game?.awayTeam||'')}" placeholder="e.g. Texas" /></div>
+      <div class="form-group" style="flex:2"><label class="form-label">Away Team</label><input class="form-input" id="m-away" value="${escHtml(game?.awayTeam||'')}" placeholder="e.g. Texas" /></div>
       <div class="form-group" style="flex:1"><label class="form-label">Away Mascot</label><input class="form-input" id="m-away-mascot" value="${escHtml(game?.awayMascot||'')}" placeholder="Longhorns" /></div>
     </div>
     <p class="text-muted text-xs mb-md">Display will be "School (Mascot)" — leave Mascot blank to use the auto lookup.</p>
     <div class="form-group"><label class="form-label">Kickoff (local time)</label>
       <input class="form-input" id="m-kickoff" type="datetime-local" value="${game?.kickoff?new Date(game.kickoff).toISOString().slice(0,16):''}" /></div>
 
-    <!-- Foolproof spread input: pick favorite, enter positive margin. We compute
-         the signed home-perspective spread on save so a sign error becomes
-         impossible (Priority 1: spread bug audit). -->
     <div class="form-group"><label class="form-label">Spread</label>
       <div class="spread-input-row">
         <select class="form-select" id="m-spread-fav">
@@ -3789,8 +3969,69 @@ function showGameModal(game, week, onSave) {
         </select>
         <input class="form-input" id="m-spread-margin" type="number" step="0.5" min="0" placeholder="margin (positive)" value="${initMargin}" />
       </div>
-      <p class="text-muted text-xs mt-sm">Pick which team is favored and enter the spread as a positive number. e.g. Virginia -3 → "Home favored" (if Virginia is home) and Margin "3".</p>
+      <p class="text-muted text-xs mt-sm">Pick which team is favored and enter the spread as a positive number.</p>
     </div>
+
+    <!-- Scoring multiplier: 1x is a normal game, 2x etc. weights this game
+         in the standings. Wins AND losses scale by the same factor.
+         Tiebreakers are never multiplied. -->
+    <div class="form-group modal-subsection">
+      <label class="form-label">🎯 Win Multiplier
+        <span class="text-muted text-xs">(marquee/rivalry weight, tiebreaker never multiplied)</span>
+      </label>
+      <div class="mult-input-row">
+        <select class="form-select" id="m-mult-preset">
+          <option value="1"${initMultiplier===1?' selected':''}>1x — Normal game</option>
+          <option value="1.5"${initMultiplier===1.5?' selected':''}>1.5x</option>
+          <option value="2"${initMultiplier===2?' selected':''}>2x — Marquee (rivalry, playoff)</option>
+          <option value="3"${initMultiplier===3?' selected':''}>3x — Championship-tier</option>
+          <option value="custom"${[1,1.5,2,3].indexOf(initMultiplier)<0?' selected':''}>Custom…</option>
+        </select>
+        <input class="form-input" id="m-mult-custom" type="number" step="0.5" min="0.5" max="10"
+          placeholder="e.g. 2.5" value="${[1,1.5,2,3].indexOf(initMultiplier)<0?initMultiplier:''}"
+          style="${[1,1.5,2,3].indexOf(initMultiplier)<0?'':'display:none'}" />
+      </div>
+      ${gameHasScored && initMultiplier !== 1 ? '<p class="text-warning text-xs mt-sm">⚠️ Editing multiplier on a game that has already scored will change existing standings.</p>' : ''}
+    </div>
+
+    <!-- Manual / out-of-league game toggle. When enabled, exposes fields for
+         the league label, ESPN sport, and ESPN event ID so a one-off NFL
+         game (or similar) can flow through the SAME scoring + polling
+         pipeline as CFB games. -->
+    <div class="form-group modal-subsection">
+      <label class="checkbox-row">
+        <input type="checkbox" id="m-is-manual" ${initIsManual?'checked':''} />
+        <span><strong>This is a one-off / out-of-league game</strong>
+          <span class="text-muted text-xs"> — e.g. NFL Thanksgiving, special event</span>
+        </span>
+      </label>
+      <div id="m-manual-fields" style="${initIsManual?'':'display:none'}" class="manual-fields">
+        <div class="form-group">
+          <label class="form-label">League Label
+            <span class="text-muted text-xs">(shown as a small chip on the game — e.g. "NFL", "Special")</span>
+          </label>
+          <input class="form-input" id="m-league-label" placeholder="NFL" value="${escHtml(initLeagueLabel)}" maxlength="20" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">ESPN Live Scoring
+            <span class="text-muted text-xs">(optional — auto-updates scores if set)</span>
+          </label>
+          <div class="espn-input-row">
+            <select class="form-select" id="m-espn-sport">
+              <option value=""${!initEspnSport?' selected':''}>None (Manual entry only)</option>
+              <option value="college-football"${initEspnSport==='college-football'?' selected':''}>College Football</option>
+              <option value="nfl"${initEspnSport==='nfl'?' selected':''}>NFL</option>
+            </select>
+            <input class="form-input" id="m-espn-eventid"
+              placeholder="ESPN event ID or gamecast URL"
+              value="${escHtml(initEspnEventId)}" />
+          </div>
+          <div class="espn-mode-indicator" id="m-espn-mode">${initEspnSport && initEspnEventId ? '<span class="mode-pill mode-auto">🔄 Auto (ESPN-linked) — scores will update automatically</span>' : '<span class="mode-pill mode-manual">✍️ Manual entry only — you\'ll enter scores yourself</span>'}</div>
+          <p class="text-muted text-xs mt-sm">Paste the ESPN gamecast URL and we'll extract the event ID automatically. Ex: <code>https://www.espn.com/nfl/game/_/gameId/401671626</code></p>
+        </div>
+      </div>
+    </div>
+
     <div class="form-group"><label class="form-label">Venue (optional)</label><input class="form-input" id="m-venue" value="${escHtml(game?.venue||'')}" /></div>
     <div class="form-group"><label class="form-label">Home Conference</label><input class="form-input" id="m-hconf" value="${escHtml(game?.homeConference||'')}" /></div>
     <div class="form-group"><label class="form-label">Away Conference</label><input class="form-input" id="m-aconf" value="${escHtml(game?.awayConference||'')}" /></div>
@@ -3809,6 +4050,41 @@ function showGameModal(game, week, onSave) {
   document.body.appendChild(ov);
   ov.querySelector('#mc')?.addEventListener('click',()=>ov.remove());
   ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
+
+  // Show/hide the custom multiplier input based on the preset dropdown
+  const multPreset = ov.querySelector('#m-mult-preset');
+  const multCustom = ov.querySelector('#m-mult-custom');
+  multPreset?.addEventListener('change', () => {
+    if (multPreset.value === 'custom') {
+      multCustom.style.display = '';
+      multCustom.focus();
+    } else {
+      multCustom.style.display = 'none';
+    }
+  });
+
+  // Toggle manual-fields visibility when the checkbox flips
+  const manualCheck = ov.querySelector('#m-is-manual');
+  const manualFields = ov.querySelector('#m-manual-fields');
+  manualCheck?.addEventListener('change', () => {
+    manualFields.style.display = manualCheck.checked ? '' : 'none';
+  });
+
+  // Live-update the "Auto vs Manual" pill as the commissioner types
+  const espnSportSel = ov.querySelector('#m-espn-sport');
+  const espnEvIdInp  = ov.querySelector('#m-espn-eventid');
+  const espnMode     = ov.querySelector('#m-espn-mode');
+  const updateEspnMode = () => {
+    if (!espnMode) return;
+    const hasEv = (espnEvIdInp?.value || '').trim().length > 0;
+    const hasSport = (espnSportSel?.value || '').length > 0;
+    espnMode.innerHTML = hasEv && hasSport
+      ? '<span class="mode-pill mode-auto">🔄 Auto (ESPN-linked) — scores will update automatically</span>'
+      : '<span class="mode-pill mode-manual">✍️ Manual entry only — you\'ll enter scores yourself</span>';
+  };
+  espnSportSel?.addEventListener('change', updateEspnMode);
+  espnEvIdInp?.addEventListener('input', updateEspnMode);
+
   ov.querySelector('#m-save')?.addEventListener('click',()=>{
     const ht=document.getElementById('m-home')?.value.trim();
     const at=document.getElementById('m-away')?.value.trim();
@@ -3820,8 +4096,6 @@ function showGameModal(game, week, onSave) {
     if(!kickoff && !game){
       if(!confirm('No kickoff date/time is set. This game will be hidden from players and shown as "pending confirmation" until you set a date. Add it anyway?')) return;
     }
-    // Convert favorite+margin to signed home-perspective spread.
-    // Convention: NEGATIVE = home favored, POSITIVE = away favored, 0 = PK.
     const favPick = document.getElementById('m-spread-fav')?.value || '';
     const marginRaw = document.getElementById('m-spread-margin')?.value;
     const marginVal = marginRaw !== '' && marginRaw !== undefined ? Math.abs(parseFloat(marginRaw)) : null;
@@ -3829,7 +4103,45 @@ function showGameModal(game, week, onSave) {
     if (favPick === 'pk') { spread = 0; fav = null; }
     else if (favPick === 'home' && marginVal !== null && !isNaN(marginVal)) { spread = -marginVal; fav = ht; }
     else if (favPick === 'away' && marginVal !== null && !isNaN(marginVal)) { spread = marginVal; fav = at; }
-    // else leave spread/fav null (TBD)
+
+    // Resolve multiplier from preset or custom field
+    let multiplier = 1;
+    if (multPreset) {
+      if (multPreset.value === 'custom') {
+        const cv = Number(multCustom?.value);
+        multiplier = Number.isFinite(cv) && cv > 0 ? cv : 1;
+      } else {
+        multiplier = Number(multPreset.value) || 1;
+      }
+    }
+    // Protect standings: prompt before applying a multiplier change to a game
+    // whose scoring has already occurred.
+    if (game && gameHasScored && multiplier !== originalMultiplier) {
+      const ok = confirm(
+        `You're changing this game's multiplier from ${originalMultiplier}x to ${multiplier}x.\n\n` +
+        `This will change standings retroactively for every player.\n\nContinue?`
+      );
+      if (!ok) return;
+    }
+
+    // Manual game fields
+    const isManual = !!document.getElementById('m-is-manual')?.checked;
+    const leagueLabel = isManual ? (document.getElementById('m-league-label')?.value.trim() || '') : '';
+    const espnSport = isManual ? (document.getElementById('m-espn-sport')?.value || null) || null : null;
+    // ESPN event ID: accept either the bare ID or a gamecast URL; extract the digits.
+    let espnEventId = null;
+    if (isManual) {
+      const raw = (document.getElementById('m-espn-eventid')?.value || '').trim();
+      if (raw) {
+        // URLs look like https://www.espn.com/nfl/game/_/gameId/401671626
+        const m = raw.match(/gameId[/=](\d+)/) || raw.match(/^(\d{6,})$/);
+        espnEventId = m ? m[1] : raw;
+      }
+    } else {
+      // Non-manual games: preserve any existing pipeline-set espnEventId
+      espnEventId = game?.espnEventId || null;
+    }
+
     const venue=document.getElementById('m-venue')?.value.trim()||null;
     const hconf=document.getElementById('m-hconf')?.value.trim()||'';
     const aconf=document.getElementById('m-aconf')?.value.trim()||'';
@@ -3842,8 +4154,6 @@ function showGameModal(game, week, onSave) {
     const tw=getTimeWindow(kickoff);
     let actualWinner=null;
     if(status==='final'&&hs!==null&&as_!==null){if(hs>as_)actualWinner=ht;else if(as_>hs)actualWinner=at;}
-    // Recompute atsWinner whenever editing a final score so we don't carry
-    // stale data from a previous calculation. Uses the spread we just set.
     let atsWinner = game?.atsWinner ?? null;
     if (status === 'final' && hs !== null && as_ !== null && spread !== null) {
       const adj = hs + spread;
@@ -3857,6 +4167,7 @@ function showGameModal(game, week, onSave) {
       kickoff,spread,favorite:fav,venue,
       homeConference:hconf,awayConference:aconf,homeRank:hr,awayRank:ar,
       homeScore:hs,awayScore:as_,status,actualWinner,atsWinner,isAlmaMaterGame:isAlma,
+      multiplier, isManual, leagueLabel, espnSport, espnEventId,
       timeWindow:tw,spreadSource:'manual',dataQuality:'manual',dataSource:'manual',
       kickoffConfirmed:!!kickoff,
       lastUpdated:new Date().toISOString()});
@@ -4060,11 +4371,21 @@ function setupAutoRefresh() {
 }
 
 async function doRefreshScores(week,games) {
-  // Only ask ESPN about games that came FROM ESPN. Manual/demo games keep
-  // whatever the commissioner set — refreshing them would clobber simulated
-  // state. (We already skip the whole week above when it's demo/manual, this
-  // is a per-game belt-and-suspenders guard for mixed slates.)
-  const refreshable = games.filter(g => g.espnEventId && g.dataSource !== 'manual' && g.dataSource !== 'demo');
+  // Which games should we ask ESPN about?
+  //   - Regular CFB pipeline games (isManual falsy, espnEventId set)      → yes
+  //   - Manual out-of-league games with FULL ESPN linking (both espnSport
+  //     AND espnEventId set)                                              → yes
+  //   - Manual games without a sport/ID (commissioner enters scores)      → no
+  //   - Demo-tagged games                                                 → no
+  //
+  // The outer setupAutoRefresh already short-circuits demo/manual WEEKS, so
+  // this per-game filter is the second line of defense for mixed slates.
+  const refreshable = games.filter(g => {
+    if (!g?.espnEventId) return false;
+    if (g.dataSource === 'demo') return false;
+    if (!g.isManual) return true;                       // normal CFB path
+    return !!g.espnSport && !!g.espnEventId;            // manual w/ full ESPN linking
+  });
   if (!refreshable.length) return;
   const{updated,errors}=await refreshScoresByEventIds(
     refreshable.map(g=>g.espnEventId).filter(Boolean), refreshable
@@ -4110,7 +4431,7 @@ function exportWeekPicksCSV(week) {
   if (!week) { showToast('No week selected','error'); return; }
   const players=getPlayers().filter(p=>p.active);
   const games=getGames(week.weekId); const picks=getPicks(week.weekId);
-  const rows=[['Week','Player','Initials','Alma Mater','Tiebreaker Guess','Game (Home)','Game (Away)','Kickoff','Locked Spread','Favorite','Picked','Result','ATS Winner','Home Score','Away Score']];
+  const rows=[['Week','Player','Initials','Alma Mater','Tiebreaker Guess','Game (Home)','Game (Away)','Kickoff','Locked Spread','Favorite','Multiplier','League Label','Picked','Result','ATS Winner','Home Score','Away Score']];
   for(const player of players){
     const tbGuess=getTiebreakerGuess(week.weekId,player.playerId);
     for(const game of games){
@@ -4123,6 +4444,7 @@ function exportWeekPicksCSV(week) {
           td(game,'home'), td(game,'away'),
           game.kickoff||'',
           game.lockedSpread??game.spread??'', game.favorite||'',
+          game.multiplier??1, game.isManual ? (game.leagueLabel||'MANUAL') : '',
           pick.selectedTeam, result, game.atsWinner||'pending',
           game.homeScore??'', game.awayScore??'',
         ]);
@@ -4167,11 +4489,13 @@ function exportWeekResultsCSV(week) {
   const allPicks=getPicks(week.weekId);
   const actualTB=week.actualTiebreakerValue;
   const results=calculateWeeklyResults(week.weekId,players,allPicks,games,actualTB);
-  const rows=[['Rank','Player','Correct','Incorrect','No Decisions','Tiebreaker Guess','Actual Tiebreaker','Delta','Winner','Loser','Won by Tiebreaker']];
+  const rows=[['Rank','Player','Correct (weighted)','Incorrect (weighted)','Correct (raw count)','Incorrect (raw count)','No Decisions','Tiebreaker Guess','Actual Tiebreaker','Delta','Winner','Loser','Won by Tiebreaker']];
   for(const r of results){
     rows.push([
       r.rank, r.displayName,
-      r.correctPicks, r.incorrectPicks, r.noDecisions,
+      r.correctPicks, r.incorrectPicks,
+      r.correctCount ?? r.correctPicks, r.incorrectCount ?? r.incorrectPicks,
+      r.noDecisions,
       r.tiebreakerGuess??'', actualTB??'',
       r.tiebreakerDelta??'',
       r.isWinner?'yes':'', r.isLoser?'yes':'',
@@ -4248,14 +4572,16 @@ function exportStandingsCSV() {
 function exportAllWeeklyResultsCSV() {
   const allResults=getWeeklyResults();
   const weeksById=Object.fromEntries(getWeeks().map(w=>[w.weekId,w]));
-  const rows=[['Week','Show in History','Player','Rank','Correct','Incorrect','No Decisions','Tiebreaker Guess','Tiebreaker Delta','Winner','Loser','Won by Tiebreaker']];
+  const rows=[['Week','Show in History','Player','Rank','Correct (weighted)','Incorrect (weighted)','Correct (raw)','Incorrect (raw)','No Decisions','Tiebreaker Guess','Tiebreaker Delta','Winner','Loser','Won by Tiebreaker']];
   for(const r of allResults){
     const w=weeksById[r.weekId];
     rows.push([
       w?formatWeekLabel(w):r.weekId,
       w?(w.showInHistory!==false?'yes':'no'):'',
       r.displayName, r.rank,
-      r.correctPicks, r.incorrectPicks, r.noDecisions,
+      r.correctPicks, r.incorrectPicks,
+      r.correctCount ?? r.correctPicks, r.incorrectCount ?? r.incorrectPicks,
+      r.noDecisions,
       r.tiebreakerGuess??'', r.tiebreakerDelta??'',
       r.isWinner?'yes':'', r.isLoser?'yes':'', r.wonByTiebreaker?'yes':'',
     ]);
@@ -4353,6 +4679,27 @@ function matchupBare(game) {
   if (!game) return '';
   const sep = game.neutralSite ? 'vs' : '@';
   return `${teamSchool(game,'away')} ${sep} ${teamSchool(game,'home')}`;
+}
+
+/**
+ * Small chip cluster shown on game rows / cards: multiplier ("2x") and
+ * out-of-league label ("NFL"). Both are conditional — a normal 1x CFB game
+ * gets nothing. Returns an empty string when nothing to show so callers can
+ * concat safely.
+ */
+function renderGameBadges(game) {
+  if (!game) return '';
+  const parts = [];
+  const m = Number(game.multiplier);
+  if (Number.isFinite(m) && m > 0 && m !== 1) {
+    // Format 2 → "2x", 1.5 → "1.5x", 3 → "3x"
+    const label = (m % 1 === 0) ? `${m}x` : `${m}x`;
+    parts.push(`<span class="mult-badge" title="This game counts as ${m}× toward standings">${label}</span>`);
+  }
+  if (game.isManual && game.leagueLabel) {
+    parts.push(`<span class="league-chip" title="Out-of-league / one-off game">${escHtml(game.leagueLabel)}</span>`);
+  }
+  return parts.join('');
 }
 
 /**
