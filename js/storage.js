@@ -32,6 +32,7 @@ const KEYS = {
   SESSION:     'cfbp_session',
   LOCK_OVR:    'cfbp_lock_overrides',
   TB_GUESSES:  'cfbp_tiebreaker_guesses',
+  EP_GUESSES:  'cfbp_extra_point_guesses', // v0.16.0 — Ischemic Extra Point (longest FG, blackjack rules)
   REJECTED_SUGG: 'cfbp_rejected_suggestions',  // per-week dismissed suggested games
   REACTIONS:   'cfbp_reactions',                // per-week game emoji reactions
   FEEDBACK:    'cfbp_feedback',                 // user-submitted feature requests / issues
@@ -97,6 +98,7 @@ export function ensureSeedData() {
   if(!load(KEYS.NICKNAMES))   save(KEYS.NICKNAMES,  {});
   if(!load(KEYS.LOCK_OVR))    save(KEYS.LOCK_OVR,   {});
   if(!load(KEYS.TB_GUESSES))  save(KEYS.TB_GUESSES, {});
+  if(!load(KEYS.EP_GUESSES))  save(KEYS.EP_GUESSES, {});
   if(!load(KEYS.REJECTED_SUGG)) save(KEYS.REJECTED_SUGG, {});
   if(!load(KEYS.REACTIONS))   save(KEYS.REACTIONS,   {});
   if(!load(KEYS.FEEDBACK))    save(KEYS.FEEDBACK,    []);
@@ -116,6 +118,7 @@ export function resetToDemo() {
   save(KEYS.NICKNAMES,  {});
   save(KEYS.LOCK_OVR,   {});
   save(KEYS.TB_GUESSES, {});
+  save(KEYS.EP_GUESSES, {});
   save(KEYS.REJECTED_SUGG, {});
   save(KEYS.REACTIONS, {});
   save(KEYS.FEEDBACK, []);
@@ -275,6 +278,23 @@ export function setTiebreakerGuess(weekId,playerId,value){
   const all=getTiebreakerGuesses();
   all[`${weekId}__${playerId}`]=Number(value);
   save(KEYS.TB_GUESSES,all);
+}
+
+// ─── ISCHEMIC EXTRA POINT GUESSES (v0.16.0) ───────────────────────────────────
+// Longest-made-FG guesses, blackjack rules. Same shape as tiebreaker guesses:
+// { "weekId__playerId": yards }. Syncs through the seam like all league data.
+
+export function getExtraPointGuesses(){ return load(KEYS.EP_GUESSES)||{}; }
+export function getExtraPointGuess(weekId,playerId){
+  const v=getExtraPointGuesses()[`${weekId}__${playerId}`];
+  return v!==undefined?v:null;
+}
+export function setExtraPointGuess(weekId,playerId,value){
+  const all=getExtraPointGuesses();
+  const key=`${weekId}__${playerId}`;
+  if(value===null||value===''||value===undefined) delete all[key];
+  else all[key]=Number(value);
+  save(KEYS.EP_GUESSES,all);
 }
 
 // ─── ACTIVE WEEK ──────────────────────────────────────────────────────────────
@@ -637,6 +657,10 @@ export function resetCurrentWeekData(weekId) {
   const allTb = load(KEYS.TB_GUESSES) || {};
   Object.keys(allTb).forEach(k => { if(k.startsWith(weekId+'__')) delete allTb[k]; });
   save(KEYS.TB_GUESSES, allTb);
+  // Remove Extra Point guesses for this week
+  const allEp = load(KEYS.EP_GUESSES) || {};
+  Object.keys(allEp).forEach(k => { if(k.startsWith(weekId+'__')) delete allEp[k]; });
+  save(KEYS.EP_GUESSES, allEp);
   // Remove emoji reactions for this week
   clearReactionsForWeek(weekId);
 }
@@ -651,6 +675,7 @@ export function exportAllData(){
     picks:load(KEYS.PICKS)||[],results:load(KEYS.RESULTS)||[],
     obligations:getObligations(),nicknames:getNicknames(),
     tiebreakerGuesses:getTiebreakerGuesses(),
+    extraPointGuesses:getExtraPointGuesses(),
   };
 }
 

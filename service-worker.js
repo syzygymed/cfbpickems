@@ -1,5 +1,5 @@
 /**
- * CFB Pickems — Service Worker v10
+ * CFB Pickems — Service Worker v16
  * Caches core app shell for offline / fast load.
  *
  * v10 strategy: NETWORK-FIRST for app shell.
@@ -12,7 +12,7 @@
  *   - Bumped CACHE_NAME → cfb-pickems-v15-3 to invalidate any v9 cached files.
  */
 
-const CACHE_NAME = 'cfb-pickems-v15-3';
+const CACHE_NAME = 'cfb-pickems-v16-0';
 
 const STATIC_ASSETS = [
   './',
@@ -25,6 +25,11 @@ const STATIC_ASSETS = [
   './js/scoring.js',
   './js/notifications.js',
   './js/backend.js',
+  './js/chat.js',
+  './js/chat-ui.js',
+  './js/scribeLines.js',
+  './js/extra-point.js',
+  './js/recap.js',
   './manifest.json',
   'https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap',
 ];

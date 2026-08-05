@@ -4,8 +4,8 @@
  * One-stop place to update the user-visible version string + release date.
  * Surfaced in the footer of the Rules tab (Priority 12).
  */
-export const APP_VERSION = 'v0.15.3';
-export const APP_VERSION_DATE = '2026-06-08';
+export const APP_VERSION = 'v0.16.0';
+export const APP_VERSION_DATE = '2026-08-04';
 
 
 import {
@@ -37,6 +37,7 @@ import {
   getNickname, setNickname, getDisplayNamePlain,
   getGameLockOverrides, setGameLockOverride, clearAllLockOverrides,
   getTiebreakerGuess, setTiebreakerGuess, getTiebreakerGuesses,
+  getExtraPointGuess, setExtraPointGuess, getExtraPointGuesses,
   getRejectedSuggestions, rejectSuggestion, unrejectSuggestion,
   clearRejectedSuggestions, isSuggestionRejected, suggestionKeyOf,
   getReactionsForGame, toggleReaction,
@@ -72,7 +73,22 @@ import {
   hydrate as hydrateBackend, seedFromLocal, flushPush,
   refreshFromBackend, createSnapshot, listSnapshots, restoreSnapshot,
   onBackendStatus, getSyncStatus, loadDeployedConfig,
+  primeFromMirror, isMirrorStale, clearMirror,
 } from './backend.js';
+
+// ── v0.16.0 modules ──────────────────────────────────────────────────────────
+import {
+  initChatUI, renderChatPage, gameChatBubbleHTML, dashboardChatTeaserHTML,
+  updateChatBadges, openGameChatSheet, setChatChannel,
+  emitPicksLockedEvent, emitGameFinalEvent, emitExtraPointEvent, emitWeekFinalEvent,
+  chatDigest,
+} from './chat-ui.js';
+import { setPollMode } from './chat.js';
+import { renderPicksFooterHTML, renderWeekRecapCardHTML } from './recap.js';
+import {
+  detectLongestFieldGoal, gradeWeekExtraPoint, gradeExtraPoint,
+  renderExtraPointResultsHTML, EP_OUTCOME_LABEL,
+} from './extra-point.js';
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 
@@ -81,6 +97,8 @@ const state = {
   draftPicks: {}, draftTiebreaker: null,
   editingPicks: false, // true while a logged-in player is updating their already-submitted picks
   dashboardWeekId: null,
+  picksWeekId: null,      // v0.16.0 — non-null when viewing a previous locked/closed week on the Picks tab
+  draftExtraPoint: null,  // v0.16.0 — Ischemic Extra Point guess (longest FG, yards)
   // Active tab within the Commissioner panel (week / games / players / settings / data)
   commTab: 'week',
   lastFetchResult: null,
@@ -99,72 +117,79 @@ const state = {
 document.addEventListener('DOMContentLoaded', () => { boot(); });
 
 async function boot() {
-  // Auto-connect path (Option A): read config.json baked into the deployed
-  // site. When the commissioner has set backendUrl + backendToken there, EVERY
-  // device that opens the site auto-connects — players never see a config UI.
-  // We still respect a manually-entered localStorage config (legacy path) so
-  // existing devices that did per-device setup keep working.
+  // ── v0.16.0 FAST BOOT ──────────────────────────────────────────────────────
+  // Root cause of the old ~20s blank: boot awaited a full Google Apps Script
+  // getAll (10–20s cold start) BEFORE anything rendered — even the PIN gate —
+  // and the gate then window.location.reload()ed into a SECOND boot + hydrate.
+  // New model (AD-08 in DEVELOPMENT_LEDGER.md):
+  //   1. Prime the in-memory cache SYNCHRONOUSLY from the last successful
+  //      snapshot (localStorage mirror) and paint immediately.
+  //   2. The PIN gate is an OVERLAY — no body nuke, no reload, no second boot.
+  //   3. hydrate() runs in the background: visible "Syncing…" badge while
+  //      stale, one-shot re-render when fresh data lands, LOUD red banner on
+  //      failure (unchanged), and pushes are HELD while stale so a stale
+  //      mirror can never clobber fresher remote data.
   let backendErrorBanner = null;
-  const deployed = await loadDeployedConfig();
-  if (deployed.ok) {
-    // Always write into localStorage so the rest of the app's plumbing
-    // (Cloud Sync panel, beforeunload flushPush, etc.) sees a real config.
-    setBackendConfig(deployed.url, deployed.token);
-  }
 
-  if (isBackendConfigured()) {
-    try {
-      refreshHeader();
-      await hydrateBackend();
-      setBackendMode('googleSheets');
-      ensureSeedData();
-      // Silent on success — toast would be noise on every reload
-    } catch (err) {
-      // LOUD failure: per user requirement, players + commissioner must KNOW
-      // their picks aren't syncing. We do continue with local mode so the app
-      // still works, but a persistent red banner stays up until the connection
-      // is restored or the user explicitly dismisses it, and every save shows
-      // a yellow warning toast.
-      const msg = String(err.message || err);
-      console.error('[backend] hydrate failed:', err);
-      setBackendMode('local');
-      initStorage();
-      backendErrorBanner = msg;
-    }
-  } else if (deployed.ok === false && deployed.reason === 'malformed') {
-    // config.json exists but is broken — this is unambiguously an error worth
-    // surfacing (fork-friendly silence only applies to missing/empty configs).
-    console.error('[backend] config.json malformed:', deployed.error);
-    setBackendMode('local');
-    initStorage();
-    backendErrorBanner = `config.json is invalid (${deployed.error}). Cross-device sync is OFF.`;
-  } else {
-    // No config provided — silent local-only mode (fork-friendly default).
-    setBackendMode('local');
-    initStorage();
-  }
-
-  // Reflect background sync status in the header
   onBackendStatus((status, detail) => {
     updateSyncBadge(status);
-    // Late sync errors (after boot) also surface as the persistent banner
-    // so the commissioner can see something went wrong after, say, a token
-    // rotation or a Google Apps Script quota hit.
     if (status === 'error' && detail?.error) showBackendErrorBanner(detail.error);
     if (status === 'synced') hideBackendErrorBanner();
   });
+
+  const primedKeys = primeFromMirror();
+  let rendered = false;
+
+  if (primedKeys > 0) {
+    setBackendMode('googleSheets');   // serve last-known data instantly
+    updateSyncBadge('syncing');
+  }
 
   setupNav(); refreshHeader(); renderTzToggle(); renderThemeToggle(); applyTheme(getTheme()); setupAutoRefresh();
   if (!getSettings().dashboardLayout && typeof window !== 'undefined' && window.innerWidth && window.innerWidth < 600) {
     saveSetting('dashboardLayout', 'compact');
   }
-  if (!isSiteUnlocked()) { showSitePinGate(); revealApp(); return; }
-  navigateTo('dashboard');
-  revealApp();
 
-  // Show the persistent error banner AFTER reveal so it appears over the
-  // first rendered screen rather than the boot-time hidden body.
+  if (primedKeys > 0) { navigateTo('dashboard'); rendered = true; }
+  // (No mirror yet: leave the built-in section skeletons up until we know
+  //  whether this device is cloud-connected — never flash seeded demo data
+  //  over a shared league, and never seed INTO an unhydrated backend.)
+
+  if (!isSiteUnlocked()) showSitePinGate();
+  revealApp();   // paint happens NOW — hydration overlaps PIN entry
+
+  // ── Background connect + hydrate ──────────────────────────────────────────
+  try {
+    const deployed = await loadDeployedConfig();   // same-origin fetch, ~fast
+    if (deployed.ok) setBackendConfig(deployed.url, deployed.token);
+
+    if (isBackendConfigured()) {
+      await hydrateBackend();          // cold start happens here, off-screen
+      setBackendMode('googleSheets');
+      ensureSeedData();
+      refreshHeader();
+      navigateTo(rendered ? (state.currentTab || 'dashboard') : 'dashboard');
+      rendered = true;
+    } else if (deployed.ok === false && deployed.reason === 'malformed') {
+      console.error('[backend] config.json malformed:', deployed.error);
+      backendErrorBanner = `config.json is invalid (${deployed.error}). Cross-device sync is OFF.`;
+      if (!rendered) { setBackendMode('local'); initStorage(); navigateTo('dashboard'); rendered = true; }
+    } else {
+      // No config anywhere — fork-friendly local-only mode.
+      if (!rendered) { setBackendMode('local'); initStorage(); navigateTo('dashboard'); rendered = true; }
+    }
+  } catch (err) {
+    // LOUD failure (unchanged policy): players + commissioner must KNOW their
+    // picks aren't syncing. Persistent red banner; app stays usable.
+    const msg = String(err.message || err);
+    console.error('[backend] hydrate failed:', err);
+    backendErrorBanner = msg;
+    if (!rendered) { setBackendMode('local'); initStorage(); navigateTo('dashboard'); rendered = true; }
+  }
   if (backendErrorBanner) showBackendErrorBanner(backendErrorBanner);
+
+  // Chat engine + badges (v0.16.0)
+  try { initChatUI(); updateChatBadges(); } catch (e) { console.warn('[chat] init failed', e); }
 
   window.addEventListener('beforeunload', () => { try { flushPush(); } catch {} });
 }
@@ -247,7 +272,9 @@ function navigateTo(tab) {
   state.currentTab = tab;
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.querySelectorAll('.page-section').forEach(el => el.classList.toggle('active', el.id === `page-${tab}`));
-  ({ picks: renderPicksPage, dashboard: renderDashboard, leaderboard: renderLeaderboard, commissioner: renderCommPage, rules: renderRulesPage })[tab]?.();
+  ({ picks: renderPicksPage, dashboard: renderDashboard, leaderboard: renderLeaderboard, commissioner: renderCommPage, rules: renderRulesPage, chat: renderChatPage })[tab]?.();
+  // Chat polls fast only while the chat tab is open (v0.16.0)
+  try { setPollMode(tab === 'chat' ? 'active' : 'passive'); updateChatBadges(); } catch {}
 }
 
 function refreshHeader() {
@@ -367,6 +394,102 @@ function canViewOtherPicks(week, viewerPlayerId) {
 // ─── PICKS PAGE ───────────────────────────────────────────────────────────────
 
 function renderPicksPage() {
+  // v0.16.0 dispatcher — supports viewing previous locked/closed weeks
+  // (read-only) and appends the week-nav + recap footer around every branch
+  // of the current-week renderer.
+  const c = document.getElementById('page-picks'); if (!c) return;
+  const currentWeek = getCurrentWeek();
+  const viewWeek = state.picksWeekId ? getWeek(state.picksWeekId) : null;
+  if (viewWeek && currentWeek && viewWeek.weekId !== currentWeek.weekId) {
+    renderHistoricalPicksView(c, viewWeek, currentWeek);
+    return;
+  }
+  state.picksWeekId = null;
+  renderPicksPageCurrent();
+  c.insertAdjacentHTML('afterbegin', renderPicksWeekNav(currentWeek, currentWeek));
+  bindPicksWeekNav();
+  c.insertAdjacentHTML('beforeend', renderPicksFooterHTML(currentWeek));
+}
+
+/** Weeks a player may browse on the Picks tab: current week + anything locked/live/final. */
+function picksNavWeeks() {
+  const weeks = getWeeks().filter(w => w.showInHistory !== false && w.status !== WEEK_STATUS.DRAFT);
+  return weeks.sort((a, b) => String(a.season).localeCompare(String(b.season)) || a.weekNumber - b.weekNumber);
+}
+
+function renderPicksWeekNav(viewWeek, currentWeek) {
+  if (!viewWeek) return '';
+  const weeks = picksNavWeeks();
+  if (weeks.length < 2) return '';
+  const idx = weeks.findIndex(w => w.weekId === viewWeek.weekId);
+  const prev = idx > 0 ? weeks[idx - 1] : null;
+  const next = idx >= 0 && idx < weeks.length - 1 ? weeks[idx + 1] : null;
+  const isCurrent = viewWeek.weekId === currentWeek?.weekId;
+  return `
+    <div class="picks-week-nav">
+      <button class="btn btn-ghost btn-sm" data-picks-week="${prev ? escHtml(prev.weekId) : ''}" ${prev ? '' : 'disabled'}>‹</button>
+      <div class="picks-week-nav-label">${escHtml(formatWeekLabel(viewWeek))}${isCurrent ? ' <span class="picks-week-current">· current</span>' : ' <span class="picks-week-past">· past week (read-only)</span>'}</div>
+      <button class="btn btn-ghost btn-sm" data-picks-week="${next ? escHtml(next.weekId) : ''}" ${next ? '' : 'disabled'}>›</button>
+    </div>`;
+}
+
+function bindPicksWeekNav() {
+  document.querySelectorAll('[data-picks-week]').forEach(b => b.addEventListener('click', () => {
+    if (!b.dataset.picksWeek) return;
+    const cur = getCurrentWeek();
+    state.picksWeekId = (b.dataset.picksWeek === cur?.weekId) ? null : b.dataset.picksWeek;
+    renderPicksPage();
+    window.scrollTo({ top: 0 });
+  }));
+}
+
+/** Read-only view of a previous locked/closed week (v0.16.0). Blind-picks rule
+ *  preserved: for LOCKED weeks only the viewer's own picks show; live/final
+ *  weeks are public just like the dashboard. */
+function renderHistoricalPicksView(c, week, currentWeek) {
+  const session = getSession();
+  const eff = getEffectiveWeekStatus(week);
+  const isPublic = eff === 'live' || eff === 'final' || week.status === 'final';
+  const games = getGames(week.weekId).sort((a, b) => new Date(a.kickoff) - new Date(b.kickoff));
+  const myId = session.playerId && session.playerVerified ? session.playerId : null;
+
+  let body = '';
+  if (!isPublic && !myId) {
+    body = `<div class="week-status-card"><div class="week-status-icon">🔒</div>
+      <div class="week-status-body"><div class="week-status-title">Locked week</div>
+      <div class="week-status-msg">Log in on the current week to view your own picks for this week.</div></div></div>`;
+  } else {
+    const myPicks = myId ? getPicks(week.weekId, myId) : [];
+    const rows = games.map(g => {
+      const pick = myPicks.find(p => p.gameId === g.gameId) || null;
+      const ats = g.atsWinner ?? calculateAtsWinner(g);
+      const showAts = isPublic && ats;
+      let pickBadge = '';
+      if (pick) {
+        const res = evaluatePick(pick, g);
+        pickBadge = `<span class="hist-pick ${getResultBadgeClass(res)}">${escHtml(pick.selectedTeam)} ${res === PICK_RESULT.WIN ? '✓' : res === PICK_RESULT.LOSS ? '✗' : ''}</span>`;
+      }
+      const score = (g.homeScore != null && g.awayScore != null) ? `${g.awayScore}–${g.homeScore}` : '';
+      return `<div class="hist-game-row">
+        <div class="hist-matchup">${escHtml(getTeamDisplay(g, 'away'))} @ ${escHtml(getTeamDisplay(g, 'home'))}
+          <span class="text-muted text-xs">${escHtml(formatSpread(g.lockedSpread ?? g.spread, g.favorite, g) || '')}</span></div>
+        <div class="hist-right">${score ? `<span class="hist-score">${score}</span>` : ''}
+          ${showAts && ats !== 'no_decision' ? `<span class="hist-ats">ATS: ${escHtml(ats)}</span>` : showAts ? '<span class="hist-ats">Push</span>' : ''}
+          ${pickBadge}</div>
+      </div>`;
+    }).join('');
+    body = `<div class="card mb-md">${rows || '<p class="text-muted">No games recorded for this week.</p>'}</div>`;
+  }
+
+  c.innerHTML = `
+    ${renderPicksWeekNav(week, currentWeek)}
+    ${renderWeekBanner(week)}
+    ${body}
+    ${week.status === 'final' ? renderWeekRecapCardHTML(week) : ''}`;
+  bindPicksWeekNav();
+}
+
+function renderPicksPageCurrent() {
   const c = document.getElementById('page-picks'); if (!c) return;
   const session = getSession();
   const week    = getCurrentWeek();
@@ -410,6 +533,8 @@ function renderPicksPage() {
     existing.forEach(p => { state.draftPicks[p.gameId] = p.selectedTeam; });
     const tb = getTiebreakerGuess(week.weekId, session.playerId);
     if (tb !== null && tb !== undefined) state.draftTiebreaker = tb;
+    const ep = getExtraPointGuess(week.weekId, session.playerId);
+    if (ep !== null && ep !== undefined) state.draftExtraPoint = ep;
   }
 
   c.innerHTML = `
@@ -426,6 +551,7 @@ function renderPicksPage() {
     </div>
     <div id="games-list"></div>
     ${renderTiebreakerInput(week)}
+    ${renderExtraPointInput(week)}
     <div class="submit-bar">
       <div class="submit-progress"><strong id="pick-count">0</strong>/${games.length} + tiebreaker</div>
       <button class="btn btn-primary" id="submit-picks-btn" disabled>${state.editingPicks?'Update Picks':'Submit All Picks'}</button>
@@ -435,6 +561,9 @@ function renderPicksPage() {
   document.getElementById('tb-input')?.addEventListener('input', e => {
     state.draftTiebreaker = e.target.value !== '' ? parseFloat(e.target.value) : null;
     updateSubmitEnabled(games, week);
+  });
+  document.getElementById('ep-input')?.addEventListener('input', e => {
+    state.draftExtraPoint = e.target.value !== '' ? parseInt(e.target.value, 10) : null;
   });
   // Priority 8: Randomize-my-picks button. Operates only on games still
   // pickable (skips locked/live/final), so it can be safely re-clicked late
@@ -459,6 +588,19 @@ function renderPicksPage() {
   bindPickButtons(games, week);
   document.getElementById('submit-picks-btn')?.addEventListener('click', () => submitPicks(week, games));
   updateSubmitEnabled(games, week);
+}
+
+/** v0.16.0 — The Ischemic Extra Point guess input (optional side bet). */
+function renderExtraPointInput(week) {
+  if (!week || week.extraPointEnabled === false) return '';
+  const val = state.draftExtraPoint !== null && state.draftExtraPoint !== undefined ? state.draftExtraPoint : '';
+  return `
+    <div class="card mb-md ep-input-card">
+      <label class="form-label" for="ep-input">🎯 The Ischemic Extra Point <span class="text-muted text-xs">(blackjack rules)</span></label>
+      <p class="text-muted text-xs mb-sm">Longest MADE field goal on this week's slate, in yards. Closest without going over wins. Over = bust. Exact = blackjack.</p>
+      <input class="form-input" id="ep-input" type="number" inputmode="numeric" min="15" max="75" step="1"
+        placeholder="e.g. 52" value="${val}" />
+    </div>`;
 }
 
 function renderTiebreakerInput(week) {
@@ -836,8 +978,15 @@ function submitPicks(week, games) {
   saveAllPicks(newPicks);
   if(state.draftTiebreaker!==null&&!isNaN(state.draftTiebreaker))
     setTiebreakerGuess(week.weekId,session.playerId,state.draftTiebreaker);
+  if(state.draftExtraPoint!==null&&!isNaN(state.draftExtraPoint))
+    setExtraPointGuess(week.weekId,session.playerId,state.draftExtraPoint);
+  // v0.16.0 — system chat event. HARD RULE: count only, never the selections.
+  try {
+    const totalPicks = getPicks(week.weekId, session.playerId).length;
+    emitPicksLockedEvent(week.weekId, session.playerId, totalPicks, games.length);
+  } catch {}
   const wasEditing = state.editingPicks;
-  state.draftPicks={}; state.draftTiebreaker=null; state.editingPicks=false;
+  state.draftPicks={}; state.draftTiebreaker=null; state.draftExtraPoint=null; state.editingPicks=false;
   showToast(syncBroken
     ? '✅ Picks saved locally. ⚠️ Sync still off — picks not yet shared.'
     : (wasEditing ? '✅ Picks updated!' : '✅ Picks submitted! Good luck!'),'success');
@@ -907,6 +1056,15 @@ function renderAlmaMaterWatch(weekId, games) {
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
 function renderDashboard() {
+  renderDashboardInner();
+  // v0.16.0 — chat teaser card pinned to the top of the dashboard
+  const host = document.getElementById('page-dashboard');
+  if (host && !document.getElementById('dash-chat-teaser')) {
+    host.insertAdjacentHTML('afterbegin', dashboardChatTeaserHTML());
+  }
+}
+
+function renderDashboardInner() {
   const c=document.getElementById('page-dashboard'); if(!c)return;
   const session=getSession();  const allWeeks=getWeeks().filter(w=>w.status!==WEEK_STATUS.DRAFT).sort((a,b)=>b.weekNumber-a.weekNumber);
   const currentWeek=getCurrentWeek();
@@ -1291,7 +1449,7 @@ function renderDashboardTable(players,games,allPicks,weeklyResults,weekId,actual
             : ''}
         </div>
         ${renderReactionStrip(weekId, game.gameId, players)}
-        ${renderCommentBubble(weekId, game)}
+        ${gameChatBubbleHTML(game.gameId)}
       </td>${pickCells}
     </tr>`;
   }).join('');
@@ -1683,7 +1841,7 @@ function renderDashboardCompact(players, games, allPicks, weeklyResults, weekId,
       </div>
       <div class="dc-chips">${chips}</div>
       ${renderReactionStrip(weekId, game.gameId, players)}
-      ${renderCommentBubble(weekId, game)}
+      ${gameChatBubbleHTML(game.gameId)}
     </div>`;
   }).join('');
 
@@ -2432,6 +2590,7 @@ function renderCommPage() {
     });
     wireCollapsibleSections(c);
     bindCommEventListeners(week, games, availGames, suggested, settings, allWeeks);
+    renderCommExtrasV16(week, games);   // v0.16.0 — Extra Point + Chat/SCRIBE admin
 
   } catch(err) {
     console.error('[renderCommPage] crash:', err);
@@ -4233,13 +4392,85 @@ function renderRulesPage() {
   const c=document.getElementById('page-rules'); if(!c)return;
   const rules=getSettings().customRules||DEFAULT_RULES;
   c.innerHTML=`
-    <div class="section-header"><h2>How to Play</h2><div class="subtitle">CFB Pickems Rules</div></div>
+    <div class="section-header"><h2>How to Play</h2><div class="subtitle">Rules · FAQ · Permissions</div></div>
+
+    <!-- v0.16.0 — What to do & when: the week lifecycle -->
+    <div class="card mb-md">
+      <div class="rules-section"><h3>🗓 The Week Lifecycle — what you can do &amp; when</h3>
+        <div class="faq-lifecycle">
+          <div class="faq-stage"><span class="badge badge-draft">DRAFT</span>
+            <div><strong>Commissioner is building the slate.</strong> Players can't see or pick anything yet. Sit tight.</div></div>
+          <div class="faq-stage"><span class="badge badge-open">OPEN</span>
+            <div><strong>Picks are open.</strong> Log in on the Picks tab, pick all games against the spread, answer the tiebreaker, and (optionally) enter your Ischemic Extra Point guess. Submit. <em>You can come back and edit everything — picks, tiebreaker, Extra Point — as many times as you want until lock.</em> Picks are blind: nobody sees anyone else's picks until they've submitted their own.</div></div>
+          <div class="faq-stage"><span class="badge badge-locked">LOCKED</span>
+            <div><strong>The week has locked.</strong> No new picks, no edits — for anyone, including games that haven't kicked off yet. If you missed the deadline, that's a documented adverse event. The Commissioner can grant a per-game unlock in genuine emergencies (their call, on the record).</div></div>
+          <div class="faq-stage"><span class="badge badge-live">LIVE</span>
+            <div><strong>Games are being played.</strong> The Dashboard is public — everyone's picks are visible, scores stream in from ESPN, and each pick shows a soft "covering / trailing" state. Nothing is final until the game is final. This is prime chat time.</div></div>
+          <div class="faq-stage"><span class="badge badge-final">FINAL</span>
+            <div><strong>The week is graded.</strong> ATS results are locked against the closing spread, the tiebreaker and Extra Point resolve, standings update, and drink debts post to the ledger. The week becomes browsable read-only from the Picks tab (‹ › arrows).</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- v0.16.0 — Who can do what -->
+    <div class="card mb-md">
+      <div class="rules-section"><h3>🔑 Permissions — who can do what</h3>
+        <table class="faq-perms"><thead><tr><th></th><th>Player</th><th>Commissioner</th></tr></thead><tbody>
+          <tr><td>Make / edit own picks (while OPEN)</td><td>✅</td><td>✅</td></tr>
+          <tr><td>Edit picks after LOCK</td><td>❌</td><td>⚠️ per-game unlock only, logged</td></tr>
+          <tr><td>See others' picks before submitting</td><td>❌ never</td><td>✅ (admin view)</td></tr>
+          <tr><td>Change tiebreaker / Extra Point (while OPEN)</td><td>✅</td><td>✅</td></tr>
+          <tr><td>Build the slate, set spreads, lock the week</td><td>❌</td><td>✅</td></tr>
+          <tr><td>Enter/override scores &amp; the Extra Point actual</td><td>❌</td><td>✅</td></tr>
+          <tr><td>Finalize the week, reopen for corrections</td><td>❌</td><td>✅</td></tr>
+          <tr><td>Chat, react, reply</td><td>✅</td><td>✅</td></tr>
+          <tr><td>Edit own chat message</td><td>✅ within 5 min</td><td>✅ within 5 min</td></tr>
+          <tr><td>Delete own chat message</td><td>✅ (tombstone stays)</td><td>✅</td></tr>
+          <tr><td>Reset PINs, manage players, exports, resets</td><td>❌</td><td>✅</td></tr>
+        </tbody></table>
+        <p class="text-muted text-xs mt-sm">The app never leaks picks: automated posts announce <em>that</em> you locked picks (e.g. "Kevin locked 6/6") — never <em>what</em> you picked — until lock time.</p>
+      </div>
+    </div>
+
+    <!-- v0.16.0 — Extra Point -->
+    <div class="card mb-md">
+      <div class="rules-section"><h3>🎯 The Ischemic Extra Point (blackjack rules)</h3>
+        <ul class="rules-list">
+          <li>Each week, guess the <strong>longest MADE field goal on the slate</strong>, in yards.</li>
+          <li><strong>Closest without going over wins.</strong> Any guess over the actual is a <strong>bust</strong> — you're out.</li>
+          <li>Hit it exactly = <strong>Blackjack</strong>. Outright win, beats everything.</li>
+          <li>Tied winning guesses share the win. Everyone busts → the house (the chart) wins.</li>
+          <li>Optional side bet — skipping it just means you can't win it. The actual is auto-detected from ESPN scoring plays and verified by the Commissioner.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.16.0 — Chat rules -->
+    <div class="card mb-md">
+      <div class="rules-section"><h3>💬 League Chat</h3>
+        <ul class="rules-list">
+          <li>One running thread for the league, plus a thread per game (💬 on any game card) and a weekly thread.</li>
+          <li>React, reply, edit your own messages within 5 minutes, withdraw with a tombstone. The log is append-only — SCRIBE keeps the receipts.</li>
+          <li><strong>S.C.R.I.B.E.</strong> lives in the chat. It documents lock times, finals, busts, and outstanding balances. Summon it with @scribe at your own risk.</li>
+          <li>House rule, inherited and non-negotiable: savage about football, never about real life.</li>
+        </ul>
+      </div>
+    </div>
+
     <div class="card mb-md">
       ${rules.map(s=>`<div class="rules-section"><h3>${escHtml(s.section)}</h3>
         <ul class="rules-list">${s.items.map(i=>`<li>${escHtml(i)}</li>`).join('')}</ul>
       </div><div class="divider"></div>`).join('')}
       <div class="rules-section"><h3>⭐ Alma Maters</h3>
         <ul class="rules-list">${ALMA_MATERS.map(am=>`<li>${am}</li>`).join('')}</ul>
+      </div>
+      <div class="divider"></div>
+      <div class="rules-section"><h3>🍺 Debts &amp; Bylaws</h3>
+        <ul class="rules-list">
+          <li>Weekly loser owes the weekly winner. Season loser owes the season winner.</li>
+          <li>All outstanding balances are settled <strong>IN PERSON only</strong>, per league bylaw. No exceptions, no Venmo.</li>
+          <li>The ledger lives in the app. The ledger forgets nothing.</li>
+        </ul>
       </div>
     </div>
     <div class="card"><h3 style="color:var(--maroon);margin-bottom:8px">📱 Install as iPhone App</h3>
@@ -4326,6 +4557,144 @@ function submitFeedback() {
   showToast('Thanks! Feedback recorded.','success');
 }
 
+// ─── v0.16.0 COMMISSIONER EXTRAS (Extra Point + Chat / SCRIBE) ────────────────
+
+function renderCommExtrasV16(week, games) {
+  const c = document.getElementById('page-commissioner'); if (!c || !week) return;
+  const session = getSession();
+  if (!session.isAdmin) return;
+
+  const detect = week.extraPointDetect;
+  const graded = week.extraPointActual != null ? gradeWeekExtraPoint(week, getPlayers().filter(p=>p.active)) : null;
+  const guesses = getPlayers().filter(p=>p.active).map(p => {
+    const g = getExtraPointGuess(week.weekId, p.playerId);
+    return `<span class="ep-admin-guess">${escHtml(p.displayName)}: <strong>${g == null ? '—' : g + ' yd'}</strong></span>`;
+  }).join(' ');
+
+  c.insertAdjacentHTML('beforeend', `
+    <div class="card mb-md" id="comm-ep-card">
+      <h3 style="color:var(--maroon)">🎯 Ischemic Extra Point — ${escHtml(formatWeekLabel(week))}</h3>
+      <p class="text-muted text-xs">Longest made FG on the slate, blackjack rules. Detect pulls per-game scoring plays from ESPN; you can always override manually.</p>
+      <div class="mb-sm"><label class="form-label" style="font-size:.7rem">Guesses on file</label><div class="ep-admin-guesses">${guesses || '<span class="text-muted">none yet</span>'}</div></div>
+      <div class="flex gap-sm flex-wrap mb-sm">
+        <button class="btn btn-secondary btn-sm" id="ep-detect-btn">🛰 Detect Longest FG (ESPN)</button>
+        <span class="text-muted text-xs" id="ep-detect-status">${detect ? escHtml(`${detect.yards} yd — ${detect.text || ''} (${detect.matchup || ''})`) : ''}</span>
+      </div>
+      <div class="flex gap-sm flex-wrap" style="align-items:flex-end">
+        <div class="form-group" style="margin-bottom:0">
+          <label class="form-label" style="font-size:.7rem">Actual longest FG (yards)</label>
+          <input class="form-input" id="ep-actual-input" type="number" min="15" max="75" style="width:110px"
+            value="${week.extraPointActual != null ? week.extraPointActual : ''}" />
+        </div>
+        <button class="btn btn-primary btn-sm" id="ep-save-btn">Save &amp; Grade</button>
+        ${graded ? '<button class="btn btn-ghost btn-sm" id="ep-post-btn">📣 Post result to chat</button>' : ''}
+      </div>
+      <div id="ep-graded-preview">${graded ? renderExtraPointResultsHTML(week, graded, escHtml) : ''}</div>
+    </div>
+
+    <div class="card mb-md" id="comm-chat-card">
+      <h3 style="color:var(--maroon)">📋 Chat &amp; S.C.R.I.B.E.</h3>
+      <p class="text-muted text-xs">Tier 0 (deterministic lines) runs automatically with rate limits. Tier 1 lets you paste a reviewed batch of SCRIBE posts. The digest feeds recap generation.</p>
+      <div class="flex gap-sm flex-wrap mb-sm">
+        <button class="btn btn-secondary btn-sm" id="chat-digest-btn">📤 Copy weekly digest JSON</button>
+        <span class="text-muted text-xs" id="chat-digest-status"></span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" style="font-size:.7rem">SCRIBE queue (Tier 1) — paste JSON: [{"channel":"general","body":"…","postAt":"2026-08-29T18:00Z"}]</label>
+        <textarea class="form-input" id="scribe-queue-input" rows="3" placeholder='[{"channel":"general","body":"SCRIBE NOTE: …"}]'></textarea>
+      </div>
+      <div class="flex gap-sm flex-wrap mb-sm">
+        <button class="btn btn-primary btn-sm" id="scribe-queue-btn">Post queue as SCRIBE</button>
+        <span class="text-muted text-xs" id="scribe-queue-status"></span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" style="font-size:.7rem">Season recap blurb (shows on Week 1 under "The Permanent Record")</label>
+        <textarea class="form-input" id="season-recap-input" rows="3">${escHtml(getSettings().seasonRecapText || '')}</textarea>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="season-recap-save">Save blurb</button>
+    </div>`);
+
+  // ── handlers ──
+  document.getElementById('ep-detect-btn')?.addEventListener('click', async () => {
+    const st = document.getElementById('ep-detect-status');
+    if (st) st.textContent = '⏳ Fetching scoring plays…';
+    try {
+      const r = await detectLongestFieldGoal(games);
+      if (r.best) {
+        saveWeek({ ...getWeek(week.weekId), extraPointDetect: r.best });
+        const inp = document.getElementById('ep-actual-input');
+        if (inp && !inp.value) inp.value = r.best.yards;
+        if (st) st.textContent = `${r.best.yards} yd — ${r.best.text} (${r.best.matchup})` + (r.skipped.length ? ` · ${r.skipped.length} game(s) skipped` : '');
+        showToast(`🎯 Longest FG detected: ${r.best.yards} yards`, 'success');
+      } else {
+        if (st) st.textContent = 'No made FGs found' + (r.skipped.length ? ` (${r.skipped.length} game(s) unavailable)` : '');
+        showToast('No field goals found in the slate data yet', 'warning');
+      }
+      if (r.skipped.length) console.warn('[ExtraPoint] skipped:', r.skipped);
+    } catch (e) { if (st) st.textContent = '❌ ' + (e.message || e); }
+  });
+
+  document.getElementById('ep-save-btn')?.addEventListener('click', () => {
+    const v = parseInt(document.getElementById('ep-actual-input')?.value, 10);
+    if (!Number.isFinite(v)) { showToast('Enter the actual longest FG first', 'error'); return; }
+    saveWeek({ ...getWeek(week.weekId), extraPointActual: v });
+    showToast('✅ Extra Point actual saved & graded', 'success');
+    renderCommPage();
+  });
+
+  document.getElementById('ep-post-btn')?.addEventListener('click', () => {
+    const g = gradeWeekExtraPoint(getWeek(week.weekId), getPlayers().filter(p=>p.active));
+    if (g) { emitExtraPointEvent(week.weekId, g); showToast('📣 Posted to chat', 'success'); }
+  });
+
+  document.getElementById('chat-digest-btn')?.addEventListener('click', async () => {
+    const st = document.getElementById('chat-digest-status');
+    try {
+      const players = getPlayers().filter(p=>p.active);
+      const wkGames = getGames(week.weekId);
+      const picks = getPicks(week.weekId);
+      const atsLossesByPlayer = {};
+      players.forEach(p => {
+        atsLossesByPlayer[p.playerId] = picks
+          .filter(pk => pk.playerId === p.playerId)
+          .filter(pk => { const g = wkGames.find(x => x.gameId === pk.gameId); const ats = g?.atsWinner; return ats && ats !== 'no_decision' && ats !== pk.selectedTeam; })
+          .map(pk => pk.gameId);
+      });
+      const start = week.startDate ? new Date(week.startDate + 'T00:00:00').getTime() - 4*86400000 : Date.now() - 7*86400000;
+      const end = week.endDate ? new Date(week.endDate + 'T23:59:59').getTime() + 2*86400000 : Date.now();
+      const digest = chatDigest(start, end, { players, games: wkGames, atsLossesByPlayer, week: week.weekNumber });
+      await navigator.clipboard.writeText(JSON.stringify(digest, null, 2));
+      if (st) st.textContent = '✅ Copied to clipboard';
+    } catch (e) { if (st) st.textContent = '❌ ' + (e.message || e); }
+  });
+
+  document.getElementById('scribe-queue-btn')?.addEventListener('click', () => {
+    const st = document.getElementById('scribe-queue-status');
+    try {
+      const arr = JSON.parse(document.getElementById('scribe-queue-input')?.value || '[]');
+      if (!Array.isArray(arr) || !arr.length) throw new Error('Paste a non-empty JSON array');
+      let posted = 0, deferred = 0;
+      const now = Date.now();
+      arr.forEach((item, i) => {
+        const at = item.postAt ? new Date(item.postAt).getTime() : 0;
+        if (at && at > now) { deferred++; return; }   // scheduling proper lands with Tier 1
+        if (!item.body) return;
+        import('./chat.js').then(m => m.sendEvent({
+          type: 'message', channel: item.channel || 'general', body: String(item.body),
+          author: 'scribe', meta: { source: 'tier1' },
+        }));
+        posted++;
+      });
+      if (st) st.textContent = `✅ Posted ${posted}` + (deferred ? ` · ${deferred} future-dated skipped (scheduling ships with Tier 1)` : '');
+    } catch (e) { if (st) st.textContent = '❌ ' + (e.message || e); }
+  });
+
+  document.getElementById('season-recap-save')?.addEventListener('click', () => {
+    saveSetting('seasonRecapText', document.getElementById('season-recap-input')?.value || '');
+    showToast('✅ Season recap blurb saved', 'success');
+  });
+}
+
 // ─── FINALIZATION ─────────────────────────────────────────────────────────────
 
 function finalizeWeek(week) {
@@ -4339,6 +4708,23 @@ function finalizeWeek(week) {
   const freshGames=getGames(week.weekId);
   const results=calculateWeeklyResults(week.weekId,players,picks,freshGames,week.actualTiebreakerValue);
   saveAllWeeklyResults(week.weekId,results);
+  // v0.16.0 — chat system events + Extra Point grading (deterministic ids ⇒
+  // exactly-once even if several devices finalize/re-finalize).
+  try {
+    const ranked=[...results].sort((a,b)=>(a.rank??99)-(b.rank??99));
+    emitWeekFinalEvent(week, ranked);
+    freshGames.forEach(g=>{
+      const ats=g.atsWinner; if(!ats) return;
+      const gp=picks.filter(p=>p.gameId===g.gameId);
+      emitGameFinalEvent(g, ats,
+        gp.filter(p=>p.selectedTeam===ats).map(p=>p.playerId),
+        gp.filter(p=>p.selectedTeam!==ats&&ats!=='no_decision').map(p=>p.playerId));
+    });
+    if (week.extraPointActual!=null) {
+      const graded=gradeWeekExtraPoint(week, players);
+      if (graded) emitExtraPointEvent(week.weekId, graded);
+    }
+  } catch(e){ console.warn('[finalizeWeek] chat events', e); }
   const settings=getSettings();
   const winner=results.find(r=>r.isWinner);
   const loser=results.find(r=>r.isLoser);
@@ -4392,7 +4778,23 @@ async function doRefreshScores(week,games) {
   );
   for(const upd of updated){
     const stored=getGame(upd.gameId);
-    if(stored)saveGame({...stored,homeScore:upd.homeScore,awayScore:upd.awayScore,status:upd.status,actualWinner:upd.actualWinner,lastUpdated:upd.lastUpdated});
+    if(!stored) continue;
+    const wasFinal = stored.status===GAME_STATUS.FINAL;
+    saveGame({...stored,homeScore:upd.homeScore,awayScore:upd.awayScore,status:upd.status,actualWinner:upd.actualWinner,lastUpdated:upd.lastUpdated});
+    // v0.16.0 — a game just went FINAL: post the ATS result to its chat thread.
+    if (!wasFinal && upd.status===GAME_STATUS.FINAL) {
+      try {
+        const fresh=getGame(upd.gameId);
+        const ats=calculateAtsWinner(fresh);
+        if (ats) {
+          saveGame({...fresh, atsWinner: ats});
+          const gp=getPicks(week.weekId).filter(p=>p.gameId===upd.gameId);
+          emitGameFinalEvent(fresh, ats,
+            gp.filter(p=>p.selectedTeam===ats).map(p=>p.playerId),
+            gp.filter(p=>p.selectedTeam!==ats&&ats!=='no_decision').map(p=>p.playerId));
+        }
+      } catch(e){ console.warn('[refresh] game-final event', e); }
+    }
   }
   if(errors.length)console.warn('[Refresh]',errors);
 }
@@ -4883,14 +5285,19 @@ function showToast(msg,type='success'){
 // ─── SITE PIN GATE ────────────────────────────────────────────────────────────
 
 function showSitePinGate() {
+  // v0.16.0 — the gate is now an OVERLAY on top of the (already booted) app,
+  // instead of nuking document.body and reloading on success. Killing the
+  // reload removes the entire second boot + second Apps Script hydrate that
+  // caused the old post-PIN blank screen. Background hydration continues while
+  // the user types, so by the time the PIN lands the data is usually fresh.
   const s = getSettings();
-  // Two-part title: a small "welcome to" eyebrow above a larger league name.
-  // Both editable so the commissioner can rename the league without losing the
-  // "welcome to" framing. Empty values fall through to defaults.
   const titleTop  = s.welcomeTitleTop  || 'welcome to';
   const titleMain = s.welcomeTitleMain || (s.welcomeTitle ? s.welcomeTitle.replace(/^welcome to\s*/i,'') : "irb pick 'ems");
   const subtitle  = s.welcomeSubtitle || 'enter access pin';
-  document.body.innerHTML = `
+  document.getElementById('site-gate-overlay')?.remove();
+  const wrap = document.createElement('div');
+  wrap.id = 'site-gate-overlay';
+  wrap.innerHTML = `
     <div class="site-gate">
       <div class="site-gate-inner">
         <div class="site-gate-title-top">${escHtml(titleTop)}</div>
@@ -4901,17 +5308,16 @@ function showSitePinGate() {
         <div class="site-gate-error" id="site-gate-error" style="display:none">incorrect pin</div>
         <button class="site-gate-btn" id="site-gate-submit">enter</button>
       </div>
-    </div>
-    <div id="toast-container"></div>
-  `;
+    </div>`;
+  document.body.appendChild(wrap);
   const input = document.getElementById('site-pin-input');
   const errEl = document.getElementById('site-gate-error');
   const submit = () => {
     const pin = input?.value || '';
     if (verifySitePin(pin)) {
       setSiteUnlocked(true);
-      // Reload to restore full app
-      window.location.reload();
+      wrap.remove();                                  // instant — no reload
+      navigateTo(state.currentTab || 'dashboard');
     } else {
       if (errEl) errEl.style.display = 'block';
       if (input) { input.value = ''; input.focus(); }

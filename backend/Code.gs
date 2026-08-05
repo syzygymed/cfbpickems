@@ -44,6 +44,7 @@
 
 // ── Config ────────────────────────────────────────────────────────────────────
 var STORE_SHEET    = 'CFBP_STORE';
+var MSG_SHEET      = 'CFBP_MESSAGES';   // v0.16.0 — append-only chat event log
 var SNAP_SHEET     = 'CFBP_SNAPSHOTS';
 var REQUIRE_TOKEN_FOR_READ = false;   // set true to also gate reads
 var TOKEN_PROP     = 'CFBP_TOKEN';
@@ -63,6 +64,7 @@ function setup() {
     snap.getRange(1, 1, 1, 4).setValues([['id', 'label', 'json', 'createdAt']]);
     snap.setFrozenRows(1);
   }
+  ensureMsgSheet();
   // Generate a token if none exists
   var props = PropertiesService.getScriptProperties();
   if (!props.getProperty(TOKEN_PROP)) {
@@ -105,7 +107,7 @@ function handle(req, isGet) {
   }
 
   var token = PropertiesService.getScriptProperties().getProperty(TOKEN_PROP);
-  var writeActions = { set: 1, setMany: 1, snapshot: 1, restoreSnapshot: 1 };
+  var writeActions = { set: 1, setMany: 1, snapshot: 1, restoreSnapshot: 1, chatAppend: 1 };
   var needsToken = writeActions[action] || REQUIRE_TOKEN_FOR_READ;
   if (needsToken && req.token !== token) {
     return json({ ok: false, error: 'Unauthorized' });
@@ -120,6 +122,10 @@ function handle(req, isGet) {
       case 'snapshot':        return json({ ok: true, id: makeSnapshot(req.label || '') });
       case 'listSnapshots':   return json({ ok: true, snapshots: listSnapshots() });
       case 'restoreSnapshot': restoreSnapshot(req.id); return json({ ok: true });
+      // ── Chat (v0.16.0) — append-only event log ──
+      case 'chatAppend':      return json(chatAppend(req.events || []));
+      case 'chatSince':       return json(chatSince(Number(req.seq || 0), Number(req.limit || 500)));
+      case 'chatBefore':      return json(chatBefore(Number(req.seq || 0), Number(req.limit || 100)));
       default:                return json({ ok: false, error: 'Unknown action: ' + action });
     }
   } catch (err) {
@@ -231,6 +237,149 @@ function restoreSnapshot(id) {
     }
   }
   throw new Error('Snapshot not found: ' + id);
+}
+
+
+// ── Chat event log (v0.16.0) ─────────────────────────────────────────────────
+// Append-only. Rows are NEVER mutated or deleted. Columns:
+//   A seq (server-assigned monotonic int — also the row order)
+//   B id  (client UUID — idempotent dedupe key)
+//   C ts  (server epoch ms — authoritative ordering aid)
+//   D type / E author / F channel / G body / H targetId / I replyTo / J meta(JSON)
+//
+// Because seq is assigned under LockService and the row is appended in the same
+// critical section, row (seq + 1) always holds event seq. chatSince/chatBefore
+// exploit that for O(limit) reads instead of scanning the whole sheet.
+
+var MSG_HEADER = ['seq','id','ts','type','author','channel','body','targetId','replyTo','meta'];
+
+function ensureMsgSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var s = ss.getSheetByName(MSG_SHEET);
+  if (!s) {
+    s = ss.insertSheet(MSG_SHEET);
+    s.getRange(1, 1, 1, MSG_HEADER.length).setValues([MSG_HEADER]);
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+function msgHead(s) {
+  // Current max seq = number of data rows (seq starts at 1, contiguous).
+  return Math.max(0, s.getLastRow() - 1);
+}
+
+// Recently-seen ids cache to keep dedupe O(1) for the common retry case
+// without scanning the id column on every append. Falls back to a column scan
+// for ids older than the cache window.
+function knownIds(s, lookback) {
+  var last = s.getLastRow();
+  var start = Math.max(2, last - lookback + 1);
+  var ids = {};
+  if (last >= 2) {
+    var vals = s.getRange(start, 2, last - start + 1, 1).getValues();
+    for (var i = 0; i < vals.length; i++) {
+      // Map id -> seq (row - 1)
+      ids[String(vals[i][0])] = (start + i) - 1;
+    }
+  }
+  return ids;
+}
+
+function idSeqFullScan(s, id) {
+  var last = s.getLastRow();
+  if (last < 2) return null;
+  var vals = s.getRange(2, 2, last - 1, 1).getValues();
+  for (var i = 0; i < vals.length; i++) {
+    if (String(vals[i][0]) === String(id)) return i + 1; // seq
+  }
+  return null;
+}
+
+function chatAppend(events) {
+  if (!events || !events.length) {
+    var s0 = ensureMsgSheet();
+    return { ok: true, assigned: [], head: msgHead(s0) };
+  }
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var s = ensureMsgSheet();
+    var seq = msgHead(s);
+    var now = Date.now();
+    var recent = knownIds(s, 2000); // dedupe window: last 2000 events
+    var assigned = [];
+    var rows = [];
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i] || {};
+      var id = String(ev.id || '');
+      if (!id) continue;
+      var existing = recent[id];
+      if (existing === undefined) existing = idSeqFullScan(s, id) == null ? undefined : idSeqFullScan(s, id);
+      if (existing !== undefined && existing !== null) {
+        assigned.push({ id: id, seq: existing, ts: null, deduped: true });
+        continue;
+      }
+      seq += 1;
+      var body = String(ev.body || '').slice(0, 1000);
+      rows.push([
+        seq, id, now,
+        String(ev.type || 'message'),
+        String(ev.author || 'unknown'),
+        String(ev.channel || 'general'),
+        body,
+        String(ev.targetId || ''),
+        String(ev.replyTo || ''),
+        ev.meta ? JSON.stringify(ev.meta) : '',
+      ]);
+      recent[id] = seq;
+      assigned.push({ id: id, seq: seq, ts: now });
+    }
+    if (rows.length) {
+      s.getRange(s.getLastRow() + 1, 1, rows.length, MSG_HEADER.length).setValues(rows);
+    }
+    return { ok: true, assigned: assigned, head: msgHead(s) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function rowToEvent(r) {
+  var meta = null;
+  if (r[9]) { try { meta = JSON.parse(r[9]); } catch (e) { meta = null; } }
+  return {
+    seq: Number(r[0]), id: String(r[1]), ts: Number(r[2]),
+    type: String(r[3]), author: String(r[4]), channel: String(r[5]),
+    body: String(r[6] || ''), targetId: String(r[7] || ''), replyTo: String(r[8] || ''),
+    meta: meta,
+  };
+}
+
+function chatSince(afterSeq, limit) {
+  var s = ensureMsgSheet();
+  var head = msgHead(s);
+  limit = Math.max(1, Math.min(limit || 500, 1000));
+  if (head <= afterSeq) return { ok: true, events: [], head: head };
+  var startSeq = afterSeq + 1;
+  var count = Math.min(limit, head - afterSeq);
+  var vals = s.getRange(startSeq + 1, 1, count, MSG_HEADER.length).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) out.push(rowToEvent(vals[i]));
+  return { ok: true, events: out, head: head };
+}
+
+function chatBefore(beforeSeq, limit) {
+  var s = ensureMsgSheet();
+  var head = msgHead(s);
+  limit = Math.max(1, Math.min(limit || 100, 500));
+  var endSeq = Math.min(beforeSeq - 1, head);
+  if (endSeq < 1) return { ok: true, events: [], head: head };
+  var startSeq = Math.max(1, endSeq - limit + 1);
+  var count = endSeq - startSeq + 1;
+  var vals = s.getRange(startSeq + 1, 1, count, MSG_HEADER.length).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) out.push(rowToEvent(vals[i]));
+  return { ok: true, events: out, head: head };
 }
 
 // ── Utils ──────────────────────────────────────────────────────────────────

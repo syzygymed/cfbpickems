@@ -22,6 +22,23 @@
 
 const CFG_KEY = 'cfbp_backend_config';
 
+/**
+ * v0.16.0 — SNAPSHOT MIRROR (boot-performance fix).
+ * After every successful hydrate/push, the full key/value snapshot is persisted
+ * to localStorage under MIRROR_KEY. On the NEXT boot, primeFromMirror() loads
+ * it synchronously so the app renders league data in <1s instead of blocking
+ * on a Google Apps Script cold start (measured 10–20s).
+ *
+ * This is NOT a silent storage fallback (loud-fail decision still holds):
+ *  - the UI shows a visible "Syncing…" badge until the background hydrate lands;
+ *  - if that hydrate FAILS, the persistent red banner appears exactly as before;
+ *  - pushes are HELD while stale (see flushPush) so a stale mirror can never
+ *    overwrite fresher remote data — local edits are rebased onto the fresh
+ *    snapshot when hydrate completes, then pushed.
+ */
+const MIRROR_KEY = 'cfbp_sheet_mirror';
+let _stale = false;            // true = serving mirror data, hydrate not yet landed
+
 const _cache = new Map();      // key -> parsed value (the synchronous mirror)
 let _ready = false;            // true once hydrated from the Sheet
 let _config = null;            // { url, token }
@@ -99,6 +116,41 @@ export function isBackendConfigured() {
 }
 export function isBackendReady() { return _ready; }
 
+export function isMirrorStale() { return _stale; }
+
+/**
+ * Synchronously load the last-known snapshot into the in-memory cache.
+ * Returns the number of keys primed (0 = no mirror; caller must await hydrate
+ * before rendering league data). Marks the backend "ready but stale".
+ */
+export function primeFromMirror() {
+  try {
+    const raw = localStorage.getItem(MIRROR_KEY);
+    if (!raw) return 0;
+    const snap = JSON.parse(raw);
+    if (!snap || typeof snap.data !== 'object') return 0;
+    _cache.clear();
+    Object.entries(snap.data).forEach(([k, v]) => _cache.set(k, v));
+    _ready = true;
+    _stale = true;
+    _lastSyncAt = snap.at || null;
+    return _cache.size;
+  } catch (e) {
+    console.warn('[backend] mirror unreadable, ignoring', e);
+    return 0;
+  }
+}
+
+function persistMirror() {
+  try {
+    const data = {};
+    _cache.forEach((v, k) => { data[k] = v; });
+    localStorage.setItem(MIRROR_KEY, JSON.stringify({ at: new Date().toISOString(), data }));
+  } catch (e) { console.warn('[backend] mirror persist failed', e); }
+}
+
+export function clearMirror() { try { localStorage.removeItem(MIRROR_KEY); } catch {} }
+
 // ── Status events (so the UI can show a sync indicator) ────────────────────────
 export function onBackendStatus(fn) { _listeners.add(fn); return () => _listeners.delete(fn); }
 function emit(status, detail) { _listeners.forEach(fn => { try { fn(status, detail); } catch {} }); }
@@ -137,12 +189,22 @@ export async function hydrate() {
   emit('syncing');
   try {
     const data = await call('getAll');
+    // Capture any local edits made while stale (dirty keys) BEFORE clearing,
+    // then re-apply them over the fresh snapshot — user intent wins for keys
+    // they touched this session; everything else takes the fresh remote value.
+    const localEdits = new Map();
+    _dirty.forEach(k => { if (_cache.has(k)) localEdits.set(k, _cache.get(k)); });
     _cache.clear();
     Object.entries(data.data || {}).forEach(([k, v]) => _cache.set(k, v));
+    localEdits.forEach((v, k) => _cache.set(k, v));
     _ready = true;
+    _stale = false;
     _lastSyncAt = new Date().toISOString();
     _lastError = null;
+    persistMirror();
     emit('synced', { keys: _cache.size });
+    // Any held-back stale writes can now flush safely.
+    if (_dirty.size) schedulePush();
     return _cache.size;
   } catch (err) {
     _lastError = String(err.message || err);
@@ -183,6 +245,10 @@ function schedulePush() {
 export async function flushPush() {
   if (_pushTimer) { clearTimeout(_pushTimer); _pushTimer = null; }
   if (!_dirty.size) return { pushed: 0 };
+  // HOLD writes while serving stale mirror data — pushing a full blob based on
+  // a stale snapshot could clobber fresher remote data. Dirty keys stay queued
+  // and are rebased + flushed automatically when hydrate() lands.
+  if (_stale) return { pushed: 0, held: true };
   // If the backend isn't configured (e.g. user disconnected mid-session), keep
   // the dirty set for later and bail quietly instead of throwing.
   const c = getBackendConfig();
@@ -195,6 +261,7 @@ export async function flushPush() {
     await call('setMany', { entries });
     _lastSyncAt = new Date().toISOString();
     _lastError = null;
+    persistMirror();
     emit('synced', { pushed: Object.keys(entries).length });
     return { pushed: Object.keys(entries).length };
   } catch (err) {
@@ -213,3 +280,22 @@ export async function refreshFromBackend() { return hydrate(); }
 export async function createSnapshot(label = '') { return call('snapshot', { label }); }
 export async function listSnapshots() { return (await call('listSnapshots')).snapshots || []; }
 export async function restoreSnapshot(id) { const r = await call('restoreSnapshot', { id }); await hydrate(); return r; }
+
+
+// ── Chat transport (v0.16.0) ───────────────────────────────────────────────────
+// The chat log does NOT ride the debounced blob push — it has its own
+// append + incremental-fetch endpoints so six concurrent authors can never
+// clobber each other (append-only, server-assigned seq, id-level dedupe).
+
+export async function chatAppendRemote(events) {
+  const r = await call('chatAppend', { events });
+  return { assigned: r.assigned || [], head: r.head ?? 0 };
+}
+export async function chatSinceRemote(afterSeq, limit = 500) {
+  const r = await call('chatSince', { seq: afterSeq, limit });
+  return { events: r.events || [], head: r.head ?? 0 };
+}
+export async function chatBeforeRemote(beforeSeq, limit = 100) {
+  const r = await call('chatBefore', { seq: beforeSeq, limit });
+  return { events: r.events || [], head: r.head ?? 0 };
+}

@@ -258,6 +258,7 @@ export const REAL_WEEK_1_2026 = {
   tiebreakerType: TIEBREAKER_TYPE.ALMA_MATER_TOTAL,
   tiebreakerCalculationMode: TIEBREAKER_CALC_MODE.SELECTED_SLATE_ONLY,
   actualTiebreakerValue:null, tiebreakerFinalized:false,
+  extraPointEnabled:true, extraPointActual:null, extraPointDetect:null,
   createdAt:'2026-01-01T00:00:00Z', updatedAt:'2026-01-01T00:00:00Z',
   lockedAt:null, finalizedAt:null,
 };
@@ -289,6 +290,7 @@ export const DEMO_WEEK = {
   tiebreakerType: TIEBREAKER_TYPE.ALMA_MATER_TOTAL,
   tiebreakerCalculationMode: TIEBREAKER_CALC_MODE.SELECTED_SLATE_ONLY,
   actualTiebreakerValue:null, tiebreakerFinalized:false,
+  extraPointEnabled:true, extraPointActual:null, extraPointDetect:null,
   createdAt:'2026-01-01T00:00:00Z', updatedAt:'2026-01-01T00:00:00Z',
   lockedAt:null, finalizedAt:null,
 };
@@ -363,6 +365,7 @@ export function createPlayer(displayName, email='', pin='0000', almaMater='', in
 }
 
 export function createWeek(season, weekNumber, startDate='', endDate='') {
+  // v0.16.0 — weeks carry Ischemic Extra Point fields (enabled/actual/detect)
   return {
     weekId:`w_${Date.now()}`,
     season, weekNumber,
@@ -378,6 +381,7 @@ export function createWeek(season, weekNumber, startDate='', endDate='') {
     tiebreakerType: TIEBREAKER_TYPE.ALMA_MATER_TOTAL,
     tiebreakerCalculationMode: TIEBREAKER_CALC_MODE.SELECTED_SLATE_ONLY,
     actualTiebreakerValue:null, tiebreakerFinalized:false,
+    extraPointEnabled:true, extraPointActual:null, extraPointDetect:null,
     createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(),
     lockedAt:null, finalizedAt:null,
   };
