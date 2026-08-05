@@ -585,12 +585,21 @@ function balanceByTimeWindow(games, max) {
 // ─── TIME HELPERS ─────────────────────────────────────────────────────────────
 
 export function getTimeWindow(isoTime) {
+  // v0.17.0 — buckets are CENTRAL TIME by league convention (was hardcoded
+  // ET−4, which mislabeled e.g. a 9:00 AM PT kickoff as "afternoon"). Intl
+  // handles DST correctly; the manual fallback only runs if Intl is missing.
   if (!isoTime) return TIME_WINDOW.AFTERNOON;
-  const d  = new Date(isoTime);
-  const et = (d.getUTCHours() - 4 + 24) % 24;
-  if (et < 12) return TIME_WINDOW.MORNING;
-  if (et < 17) return TIME_WINDOW.AFTERNOON;
-  if (et < 21) return TIME_WINDOW.EVENING;
+  const d = new Date(isoTime);
+  let ct;
+  try {
+    ct = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', hour: 'numeric', hour12: false }).format(d));
+    if (ct === 24) ct = 0;
+  } catch {
+    ct = (d.getUTCHours() - 5 + 24) % 24;
+  }
+  if (ct < 12) return TIME_WINDOW.MORNING;
+  if (ct < 17) return TIME_WINDOW.AFTERNOON;
+  if (ct < 21) return TIME_WINDOW.EVENING;
   return TIME_WINDOW.LATE;
 }
 

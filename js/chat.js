@@ -1,120 +1,95 @@
 /**
- * CFB Pickems — Chat Core (v0.16.0, Part B)
- * ==========================================
- * One append-only event log, many views.
+ * chat.js — v0.17.0 league chat engine (REVISED spec: one room + gameTag)
+ * =======================================================================
+ * ONE chronological message log. Every message may carry an optional gameTag
+ * (a gameId). "Game threads" are filtered views of the one room — there is no
+ * room you can fail to check.
  *
- * ARCHITECTURE (locked — see DEVELOPMENT_LEDGER.md AD-09..AD-12):
- *  - Every chat datum is an EVENT: message / edit / delete / react / unreact / system.
- *  - Events are never mutated. Edits/deletes/reactions reference targetId and are
- *    FOLDED client-side into a rendered message map.
- *  - The fold is ORDER-INDEPENDENT and IDEMPOTENT: events may arrive out of order
- *    or duplicated. Events referencing an unknown targetId are buffered, not
- *    dropped, and applied when the target arrives.
- *  - Transport is append + incremental fetch (backend.js chat* functions), NOT
- *    the debounced blob push — append-only sidesteps last-write-wins clobbering
- *    between six concurrent authors.
- *  - Loud-fail: 3 consecutive poll failures → offline banner (via subscriber
- *    status). Outbox persists to localStorage (send queue, not a storage
- *    fallback); a send that fails 3 times renders FAILED with retry.
- *
- * This module owns ALL chat state. UI (chat-ui.js) subscribes and renders.
- * Nothing else touches the log directly.
+ *  - Append-only events: message / edit / delete / react / gamereact /
+ *    unreact / system / pin / unpin
+ *  - Client fold is ORDER-INDEPENDENT + IDEMPOTENT (AD-10). Events referencing
+ *    unknown targets buffer until the target arrives. react/unreact resolve
+ *    latest-wins per (emoji, author) — the naive toggle was RG-06.
+ *  - Tag resolution (the cross-talk rule): reply inherits the parent's tag
+ *    (even null); otherwise the current view's tag; otherwise null.
+ *  - Notification classes: every event carries notify. Messages/replies/
+ *    mention-responses notify; reactions, gamereacts, system events, and
+ *    unprompted SCRIBE are ambient (render, never badge).
+ *  - Transport lives ENTIRELY in chatTransport.js (AD-16). This module never
+ *    sees a URL. Polling cadence is supplied to the transport via roomMode().
+ *  - Outbox: optimistic send, 750ms coalescing window, retries with backoff,
+ *    FAILED state after 3 attempts (never silently dropped), survives reload.
+ *  - Loud-fail: transport reports offline after 3 consecutive failures; a
+ *    stale-deployment error (the v0.16 outage root cause) is surfaced
+ *    distinctly so the fix is actionable from the banner itself.
  */
 
-import { chatAppendRemote, chatSinceRemote, chatBeforeRemote, isBackendConfigured } from './backend.js';
+import {
+  appendEvents, subscribe, fetchBefore, heartbeat, StaleDeploymentError,
+} from './chatTransport.js';
+import { isBackendConfigured } from './backend.js';
 
-const OUTBOX_KEY = 'cfbp_chat_outbox';
-const LASTSEEN_KEY = 'cfbp_chat_lastseen';   // per-device map { playerId: { channel: seq } }
-const MAX_BODY = 1000;
-const SEND_MAX_ATTEMPTS = 3;
-const POLL_FAIL_BANNER_AT = 3;
+// ── Device-local persistence keys (AD-12) ─────────────────────────────────────
+const K_LASTSEEN = 'cfbp_chat_lastseen2';   // { seq, byTag: { gameId: seq } }
+const K_OUTBOX   = 'cfbp_chat_outbox2';
+const K_SEENMAP  = 'cfbp_chat_seenmap';     // { playerId: lastSeenSeq } (from presence)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
-  events: new Map(),        // id -> event (raw log, deduped)
-  bySeq: [],                // sorted seq index of confirmed events
-  head: 0,                  // highest server seq we've seen
-  backfillLow: null,        // lowest seq loaded (for scroll-back)
-  messages: new Map(),      // id -> folded message view
-  pendingByTarget: new Map(), // targetId -> [events waiting for their target]
-  outbox: [],               // [{event, attempts, status:'pending'|'failed'}]
-  pollFails: 0,
+  items: new Map(),          // id -> folded item
+  buffered: new Map(),       // targetId -> [events waiting for target]
+  head: 0,
+  outbox: [],                // [{ev, attempts}]
+  failed: new Map(),         // id -> ev
+  flushTimer: null,
   offline: false,
-  timer: null,
-  mode: 'idle',             // 'active' (chat open) | 'passive' (app open) | 'idle'
-  subscribers: new Set(),
+  staleDeployment: false,
+  lastError: '',
+  viewOpen: false,
+  selfId: null,
+  presence: [],              // [{playerId, ts, seen}]
+  seenMap: {},               // playerId -> best-known lastSeenSeq
+  unsub: null,
+  presenceTimer: null,
+  subs: new Set(),
+  backfillLow: null,
 };
 
-// ── Subscriptions ─────────────────────────────────────────────────────────────
-export function onChat(fn) { S.subscribers.add(fn); return () => S.subscribers.delete(fn); }
-function notify(kind, detail) { S.subscribers.forEach(fn => { try { fn(kind, detail); } catch {} }); }
-
+function notify(kind, detail) { S.subs.forEach(fn => { try { fn(kind, detail); } catch {} }); }
+export function onChat(fn) { S.subs.add(fn); return () => S.subs.delete(fn); }
 export function chatStatus() {
-  return { head: S.head, offline: S.offline, pollFails: S.pollFails,
-           outboxPending: S.outbox.filter(o => o.status === 'pending').length,
-           outboxFailed: S.outbox.filter(o => o.status === 'failed').length };
+  return { head: S.head, offline: S.offline, staleDeployment: S.staleDeployment,
+           lastError: S.lastError, outbox: S.outbox.length, failed: S.failed.size,
+           presence: S.presence, mode: roomMode() };
 }
 
 // ── Fold ──────────────────────────────────────────────────────────────────────
-// A folded message: { id, seq, ts, author, channel, body, replyTo, meta,
-//                     edited, deleted, reactions: {emoji:[author,…]}, local }
-
-function blankMsg(ev) {
-  return { id: ev.id, seq: ev.seq ?? null, ts: ev.ts ?? null, author: ev.author,
-           channel: ev.channel, body: ev.body || '', replyTo: ev.replyTo || '',
-           meta: ev.meta || null, type: ev.type, edited: false, deleted: false,
+function newItem(ev) {
+  return { id: ev.id, seq: ev.seq ?? null, ts: ev.ts ?? ev._localTs ?? null,
+           author: ev.author, gameTag: ev.gameTag || '', body: ev.body || '',
+           replyTo: ev.replyTo || '', notify: !!ev.notify, meta: ev.meta || null,
+           type: ev.type, edited: false, deleted: false, pinned: false,
            reactions: {}, local: !!ev.local,
-           _editTs: 0, _reactOps: new Map() };
+           _editTs: 0, _reactOps: new Map(), _pinOps: new Map() };
 }
 
-/** Apply one event to the folded map. Safe to call in any order, any number of times. */
-function applyEvent(ev) {
-  if (!ev || !ev.id) return;
-  if (ev.type === 'message' || ev.type === 'system') {
-    const existing = S.messages.get(ev.id);
-    if (existing) {
-      // Reconciliation: server-confirmed copy of an optimistic local message.
-      existing.seq = ev.seq ?? existing.seq;
-      existing.ts = ev.ts ?? existing.ts;
-      existing.local = existing.local && ev.local === true;
-    } else {
-      S.messages.set(ev.id, blankMsg(ev));
-    }
-    // Drain anything that was waiting on this target.
-    const waiting = S.pendingByTarget.get(ev.id);
-    if (waiting) { S.pendingByTarget.delete(ev.id); waiting.forEach(applyEvent); }
-    return;
-  }
-  // edit / delete / react / unreact all need their target.
-  const target = S.messages.get(ev.targetId);
-  if (!target) {
-    const arr = S.pendingByTarget.get(ev.targetId) || [];
-    if (!arr.some(e => e.id === ev.id)) arr.push(ev);
-    S.pendingByTarget.set(ev.targetId, arr);
-    return;
-  }
+function applyTo(target, ev) {
+  const stamp = (ev.ts || 0) * 1e7 + (ev.seq || 0);
   if (ev.type === 'edit') {
-    // Latest edit wins regardless of arrival order (compare event ts, then seq).
-    const stamp = (ev.ts || 0) * 1e7 + (ev.seq || 0);
-    if (stamp >= target._editTs) {
-      target._editTs = stamp;
-      target.body = (ev.body || '').slice(0, MAX_BODY);
-      target.edited = true;
-    }
+    if (stamp >= target._editTs) { target.body = ev.body || ''; target.edited = true; target._editTs = stamp; }
   } else if (ev.type === 'delete') {
     target.deleted = true;
+  } else if (ev.type === 'pin' || ev.type === 'unpin') {
+    const cur = target._pinOps.get('pin');
+    if (!cur || stamp >= cur.stamp) { target._pinOps.set('pin', { stamp }); target.pinned = ev.type === 'pin'; }
   } else if (ev.type === 'react' || ev.type === 'unreact') {
-    // ORDER-INDEPENDENT toggle resolution: for each (emoji, author) pair, the
-    // op with the LATEST (ts, seq) stamp wins — exactly like edits. Naive
-    // set add/delete would make the fold depend on arrival order.
+    // Latest-wins per (emoji, author) — order-independent (RG-06 guard).
     const emoji = ev.meta?.emoji; if (!emoji) return;
     const key = `${emoji}|${ev.author}`;
-    const stamp = (ev.ts || 0) * 1e7 + (ev.seq || 0);
     const cur = target._reactOps.get(key);
-    if (cur && cur.stamp >= stamp && cur.id !== ev.id) return;      // older op — ignore
-    if (cur && cur.id === ev.id) return;                            // exact duplicate
+    if (cur && cur.id === ev.id) return;
+    if (cur && cur.stamp >= stamp) return;
     target._reactOps.set(key, { stamp, on: ev.type === 'react', id: ev.id });
-    // Rebuild the rendered reactions from the resolved op map.
     const next = {};
     target._reactOps.forEach((op, k) => {
       if (!op.on) return;
@@ -125,364 +100,427 @@ function applyEvent(ev) {
   }
 }
 
-/** Ingest a batch of raw events (from poll, backfill, or local optimistic send). */
-export function ingest(events, { local = false } = {}) {
-  let added = 0;
-  for (const raw of events || []) {
-    if (!raw?.id) continue;
-    const ev = { ...raw, local };
-    const known = S.events.get(ev.id);
-    if (known) {
-      // Duplicate — but a server copy upgrades a local optimistic one.
-      if (known.local && !local) {
-        S.events.set(ev.id, ev);
-        applyEvent(ev);           // reconciles seq/ts on the folded message
-        if (ev.seq) trackSeq(ev.seq);
-        added++;
-      }
-      continue;
-    }
-    S.events.set(ev.id, ev);
-    if (ev.seq) trackSeq(ev.seq);
-    applyEvent(ev);
-    added++;
-  }
-  if (added) notify('events', { added });
-  return added;
-}
-
-function trackSeq(seq) {
-  if (seq > S.head) S.head = seq;
-  if (S.backfillLow === null || seq < S.backfillLow) S.backfillLow = seq;
-}
-
-// ── Read APIs (for the UI) ────────────────────────────────────────────────────
-
-function sortStamp(m) {
-  // Server ts first (authoritative), seq breaks ties, local pending messages
-  // sort by their client ts at the end of the stream.
-  return (m.ts || Date.now()) * 1e7 + (m.seq || 9999999);
-}
-
-/** Folded, chronologically sorted messages for a channel ('all' = everything). */
-export function getChannelMessages(channel = 'all') {
-  const out = [];
-  S.messages.forEach(m => {
-    if (channel === 'all' || m.channel === channel) out.push(m);
-  });
-  out.sort((a, b) => sortStamp(a) - sortStamp(b));
-  return out;
-}
-
-/** Channels that have any activity, most-recent-first, with last message. */
-export function getActiveChannels() {
-  const byChan = new Map();
-  S.messages.forEach(m => {
-    const cur = byChan.get(m.channel);
-    if (!cur || sortStamp(m) > sortStamp(cur)) byChan.set(m.channel, m);
-  });
-  return [...byChan.entries()]
-    .map(([channel, last]) => ({ channel, last }))
-    .sort((a, b) => sortStamp(b.last) - sortStamp(a.last));
-}
-
-export function getMessage(id) { return S.messages.get(id) || null; }
-
-// ── Unread tracking ───────────────────────────────────────────────────────────
-// lastSeenSeq lives per-device per-player (device-local key — reading position
-// is a per-screen concern; it deliberately does NOT ride the shared blob to
-// avoid write-amplifying the Sheet on every scroll).
-
-function lastSeenAll() {
-  try { return JSON.parse(localStorage.getItem(LASTSEEN_KEY) || '{}'); } catch { return {}; }
-}
-export function getLastSeen(playerId) { return (lastSeenAll()[playerId]) || {}; }
-export function markSeen(playerId, channel) {
-  if (!playerId) return;
-  const all = lastSeenAll();
-  const mine = all[playerId] || {};
-  const msgs = getChannelMessages(channel === 'all' ? 'all' : channel);
-  let maxSeq = mine[channel] || 0;
-  msgs.forEach(m => { if (m.seq && m.seq > maxSeq) maxSeq = m.seq; });
-  if (channel === 'all') {
-    // Seeing "All" marks every channel read up to head.
-    getActiveChannels().forEach(({ channel: ch }) => { mine[ch] = Math.max(mine[ch] || 0, S.head); });
-    mine['all'] = S.head;
-  } else {
-    mine[channel] = maxSeq;
-  }
-  all[playerId] = mine;
-  try { localStorage.setItem(LASTSEEN_KEY, JSON.stringify(all)); } catch {}
-  notify('unread');
-}
-
-export function unreadCount(playerId, channel = null) {
-  if (!playerId) return 0;
-  const seen = getLastSeen(playerId);
+/** Ingest raw events from any source (poll, backfill, optimistic local). */
+export function ingest(events, head) {
+  if (typeof head === 'number' && head > S.head) S.head = head;
   let n = 0;
-  S.messages.forEach(m => {
-    if (m.deleted || !m.seq) return;
-    if (m.author === playerId) return;               // own messages never count
-    if (channel && m.channel !== channel) return;
-    if (m.seq > (seen[m.channel] || 0)) n++;
-  });
+  for (const ev of events || []) {
+    if (!ev || !ev.id) continue;
+    if (typeof ev.seq === 'number' && ev.seq > S.head) S.head = ev.seq;
+    if (typeof ev.seq === 'number') {
+      S.backfillLow = S.backfillLow === null ? ev.seq : Math.min(S.backfillLow, ev.seq);
+    }
+
+    if (['message', 'system', 'gamereact'].includes(ev.type)) {
+      const existing = S.items.get(ev.id);
+      if (existing) {
+        // Reconcile optimistic → server-assigned
+        if (existing.seq === null && typeof ev.seq === 'number') {
+          existing.seq = ev.seq; existing.ts = ev.ts ?? existing.ts; existing.local = false;
+        }
+      } else {
+        const item = newItem(ev);
+        S.items.set(ev.id, item);
+        const waiting = S.buffered.get(ev.id);
+        if (waiting) { waiting.forEach(w => applyTo(item, w)); S.buffered.delete(ev.id); }
+        n++;
+      }
+    } else if (['edit', 'delete', 'react', 'unreact', 'pin', 'unpin'].includes(ev.type)) {
+      const target = S.items.get(ev.targetId);
+      if (target) applyTo(target, ev);
+      else {
+        if (!S.buffered.has(ev.targetId)) S.buffered.set(ev.targetId, []);
+        // buffer idempotently by event id
+        const buf = S.buffered.get(ev.targetId);
+        if (!buf.some(b => b.id === ev.id)) buf.push(ev);
+      }
+    }
+  }
+  if (n || (events && events.length)) notify('events', { added: n });
   return n;
 }
 
-// ── Outbox / optimistic send ──────────────────────────────────────────────────
+function orderKey(m) { return (m.ts || 0) * 1e7 + (m.seq || 0); }
 
-function loadOutbox() {
-  try { S.outbox = JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]'); } catch { S.outbox = []; }
-  S.outbox.forEach(o => { if (o.status === 'pending') o.attempts = o.attempts || 0; });
-}
-function persistOutbox() {
-  try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(S.outbox)); } catch {}
-}
-
-export function newId() {
-  return (crypto?.randomUUID?.() ||
-    `id_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`);
-}
-
-/**
- * Queue an event for sending; renders immediately via ingest(local).
- * Message-type events show pending state until reconciled by the server echo.
- * `id` may be supplied for DETERMINISTIC events (system + SCRIBE) so that six
- * clients firing the same trigger collapse to ONE row via server-side dedupe.
- */
-export function sendEvent({ type = 'message', channel = 'general', body = '', targetId = '', replyTo = '', meta = null, author, id = null }) {
-  const ev = {
-    id: id || newId(), type, channel,
-    body: String(body || '').slice(0, MAX_BODY),
-    targetId, replyTo, meta, author,
-    ts: Date.now(), local: true,
-  };
-  if (type === 'message' && !ev.body.trim()) return null;
-  ingest([ev], { local: true });
-  S.outbox.push({ event: strip(ev), attempts: 0, status: 'pending' });
-  persistOutbox();
-  flushOutbox();       // fire and forget; poll immediately after success
-  return ev.id;
-}
-function strip(ev) { const { local, ...rest } = ev; return rest; }
-
-let _flushing = false;
-export async function flushOutbox() {
-  if (_flushing) return;
-  const batch = S.outbox.filter(o => o.status === 'pending');
-  if (!batch.length || !isBackendConfigured()) return;
-  _flushing = true;
-  try {
-    const { assigned } = await chatAppendRemote(batch.map(o => o.event));
-    const bySent = new Map(assigned.map(a => [a.id, a]));
-    S.outbox = S.outbox.filter(o => {
-      const a = bySent.get(o.event.id);
-      if (a) {
-        // Confirmed (or deduped) — upgrade the folded message in place.
-        ingest([{ ...o.event, seq: a.seq, ts: a.ts || o.event.ts }]);
-        return false;
-      }
-      return true;
-    });
-    persistOutbox();
-    notify('sent');
-    poll();   // immediate poll after successful send
-  } catch (err) {
-    batch.forEach(o => {
-      o.attempts = (o.attempts || 0) + 1;
-      if (o.attempts >= SEND_MAX_ATTEMPTS) o.status = 'failed';
-    });
-    persistOutbox();
-    notify('sendError', { error: String(err?.message || err) });
-  } finally {
-    _flushing = false;
-  }
-}
-
-export function retryFailed(eventId = null) {
-  S.outbox.forEach(o => {
-    if (o.status === 'failed' && (!eventId || o.event.id === eventId)) {
-      o.status = 'pending'; o.attempts = 0;
+/** Chronological list. filter: {tag:'all'|''|gameId, pinned, mentionsOf, types} */
+export function getMessages(filter = {}) {
+  const tag = filter.tag ?? 'all';
+  const out = [];
+  S.items.forEach(m => {
+    if (filter.types && !filter.types.includes(m.type)) return;
+    if (tag !== 'all' && (m.gameTag || '') !== tag) return;
+    if (filter.pinned && !m.pinned) return;
+    if (filter.mentionsOf) {
+      const mentioned = (m.meta?.mentions || []).includes(filter.mentionsOf);
+      const replyToMe = m.replyTo && S.items.get(m.replyTo)?.author === filter.mentionsOf;
+      if (!(mentioned || replyToMe) || m.author === filter.mentionsOf) return;
     }
+    out.push(m);
   });
-  persistOutbox();
-  flushOutbox();
+  return out.sort((a, b) => orderKey(a) - orderKey(b));
 }
 
-export function outboxStateOf(id) {
-  const o = S.outbox.find(x => x.event.id === id);
-  return o ? o.status : null;   // null = confirmed
-}
+export function getMessage(id) { return S.items.get(id) || null; }
 
-// ── Polling ───────────────────────────────────────────────────────────────────
-const INTERVALS = { active: 8000, passive: 30000 };
-let _backoff = 0;
-
-export function setPollMode(mode) {
-  if (S.mode === mode) return;
-  S.mode = mode;
-  schedule(0);
-}
-
-function schedule(delay = null) {
-  if (S.timer) clearTimeout(S.timer);
-  if (S.mode === 'idle') return;
-  const base = INTERVALS[S.mode] || 30000;
-  S.timer = setTimeout(poll, delay !== null ? delay : (_backoff || base));
-}
-
-export async function poll() {
-  if (S.timer) { clearTimeout(S.timer); S.timer = null; }
-  if (!isBackendConfigured() || document?.hidden) { schedule(); return; }
-  try {
-    const { events, head } = await chatSinceRemote(S.head, 500);
-    if (head > S.head && !events.length) S.head = head;
-    ingest(events);
-    if (S.pollFails >= POLL_FAIL_BANNER_AT || S.offline) {
-      S.offline = false; notify('online');
-    }
-    S.pollFails = 0; _backoff = 0;
-    flushOutbox();
-  } catch (err) {
-    S.pollFails++;
-    _backoff = Math.min(60000, (INTERVALS[S.mode] || 30000) * Math.pow(2, S.pollFails - 1));
-    if (S.pollFails === POLL_FAIL_BANNER_AT) {
-      S.offline = true;
-      notify('offline', { error: String(err?.message || err) });
-    }
+// ── The cross-talk rule ───────────────────────────────────────────────────────
+/** resolveTag({replyTo, viewTag}) — reply inherits parent tag (even null);
+ *  else the current view's tag; else null. */
+export function resolveTag({ replyTo = null, viewTag = '' } = {}) {
+  if (replyTo) {
+    const parent = S.items.get(replyTo);
+    if (parent) return parent.gameTag || '';
   }
-  schedule();
+  return viewTag || '';
+}
+
+// ── Sending ───────────────────────────────────────────────────────────────────
+function uuid() {
+  return (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID()
+    : 'id_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+/** Generic event send. Deterministic ids (AD-11) make system/SCRIBE events
+ *  exactly-once across six clients — the server dedupes on id. */
+export function sendEvent(ev) {
+  const full = {
+    id: ev.id || uuid(), type: ev.type || 'message', author: ev.author || 'unknown',
+    gameTag: ev.gameTag || '', body: (ev.body || '').slice(0, 1000),
+    targetId: ev.targetId || '', replyTo: ev.replyTo || '',
+    notify: !!ev.notify, meta: ev.meta || null,
+    local: true, _localTs: Date.now(),
+  };
+  ingest([full]);                       // optimistic
+  S.outbox.push({ ev: full, attempts: 0 });
+  persistOutbox();
+  scheduleFlush();
+  return full.id;
+}
+
+export function sendMessage({ body, gameTag = '', replyTo = '', author, mentions = [], scribeReply = false }) {
+  return sendEvent({
+    type: 'message', body, gameTag, replyTo, author,
+    notify: true,
+    meta: mentions.length || scribeReply ? { mentions, ...(scribeReply ? { scribeReply: true } : {}) } : (null),
+  });
+}
+
+export function editMessage(id, body, author) {
+  const t = S.items.get(id); if (!t || t.author !== author) return null;
+  return sendEvent({ type: 'edit', targetId: id, body, author, notify: false });
+}
+export function deleteMessage(id, author) {
+  const t = S.items.get(id); if (!t || t.author !== author) return null;
+  return sendEvent({ type: 'delete', targetId: id, author, notify: false });
+}
+export function toggleReact(targetId, emoji, author) {
+  const t = S.items.get(targetId); if (!t) return null;
+  const on = (t.reactions[emoji] || []).includes(author);
+  return sendEvent({ type: on ? 'unreact' : 'react', targetId, author, notify: false, meta: { emoji } });
+}
+export function pinMessage(targetId, author, on = true) {
+  return sendEvent({ type: on ? 'pin' : 'unpin', targetId, author, notify: false });
+}
+/** Ambient game-card emoji reaction, mirrored into the room (coalesced at render). */
+export function sendGameReact(gameId, emoji, author) {
+  return sendEvent({ type: 'gamereact', gameTag: gameId, author, notify: false, meta: { emoji } });
+}
+
+// ── Outbox ────────────────────────────────────────────────────────────────────
+const FLUSH_COALESCE_MS = 750;
+const MAX_ATTEMPTS = 3;
+
+function persistOutbox() {
+  try { localStorage.setItem(K_OUTBOX, JSON.stringify(S.outbox.map(o => o.ev))); } catch {}
+}
+function loadOutbox() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(K_OUTBOX) || '[]');
+    S.outbox = arr.map(ev => ({ ev, attempts: 0 }));
+    ingest(arr.map(ev => ({ ...ev, local: true })));
+  } catch { S.outbox = []; }
+}
+function scheduleFlush() {
+  if (S.flushTimer) return;                       // coalescing window (spec §load 4)
+  S.flushTimer = setTimeout(() => { S.flushTimer = null; flushOutbox(); }, FLUSH_COALESCE_MS);
+}
+
+export async function flushOutbox() {
+  if (!S.outbox.length || !isBackendConfigured()) return;
+  const batch = S.outbox.splice(0, S.outbox.length);
+  try {
+    const { assigned, head } = await appendEvents(batch.map(o => o.ev));
+    const byId = new Map(assigned.map(a => [a.id, a]));
+    batch.forEach(o => {
+      const a = byId.get(o.ev.id);
+      const item = S.items.get(o.ev.id);
+      if (a && item) { item.seq = a.seq; if (a.ts) item.ts = a.ts; item.local = false; }
+    });
+    if (typeof head === 'number' && head > S.head) S.head = head;
+    persistOutbox();
+    notify('sent', { count: batch.length });
+  } catch (err) {
+    handleTransportError(err);
+    batch.forEach(o => {
+      o.attempts++;
+      if (o.attempts >= MAX_ATTEMPTS) {
+        S.failed.set(o.ev.id, o.ev);
+        notify('failed', { id: o.ev.id });
+      } else {
+        S.outbox.push(o);
+      }
+    });
+    persistOutbox();
+    if (S.outbox.length) setTimeout(flushOutbox, 2000 * Math.max(1, batch[0]?.attempts || 1));
+  }
+}
+
+export function retryFailed(id) {
+  const ev = S.failed.get(id);
+  if (!ev) return;
+  S.failed.delete(id);
+  S.outbox.push({ ev, attempts: 0 });
+  persistOutbox();
+  scheduleFlush();
+  notify('events', {});
+}
+export function isFailed(id) { return S.failed.has(id); }
+export function isPending(id) {
+  const m = S.items.get(id);
+  return !!m && m.local && !S.failed.has(id);
+}
+
+function handleTransportError(err) {
+  S.lastError = String(err?.message || err);
+  if (err instanceof StaleDeploymentError || err?.stale) {
+    S.staleDeployment = true;
+    if (!S.offline) { S.offline = true; notify('offline', { error: S.lastError, stale: true }); }
+  }
+}
+
+// ── Subscription (adaptive polling lives in the transport) ────────────────────
+export function roomMode() {
+  if (!S.viewOpen) return 'closed';
+  let latest = 0;
+  S.items.forEach(m => { if (m.type !== 'system' && (m.ts || 0) > latest) latest = m.ts || 0; });
+  const age = Date.now() - latest;
+  if (age < 2 * 60000) return 'hot';
+  if (age < 15 * 60000) return 'warm';
+  return 'idle';
+}
+
+export function setViewOpen(open) { S.viewOpen = !!open; }
+/** Back-compat shim for app.js ('active' when the chat tab is showing). */
+export function setPollMode(mode) { setViewOpen(mode === 'active'); }
+
+export function initChat(selfId) {
+  S.selfId = selfId || S.selfId;
+  loadOutbox();
+  try { S.seenMap = JSON.parse(localStorage.getItem(K_SEENMAP) || '{}'); } catch { S.seenMap = {}; }
+  if (S.unsub) S.unsub();
+  S.unsub = subscribe(
+    (events, head) => ingest(events, head),
+    {
+      getMode: roomMode,
+      getKnownHead: () => S.head,
+      onStatus: (s, detail) => {
+        if (s === 'online') { S.offline = false; S.staleDeployment = false; notify('online'); }
+        if (s === 'offline') {
+          S.offline = true;
+          if (detail?.stale) S.staleDeployment = true;
+          S.lastError = detail?.error || '';
+          notify('offline', detail);
+        }
+      },
+    }
+  );
+  flushOutbox();
+  startPresence();
 }
 
 export async function backfill(limit = 100) {
   if (!isBackendConfigured() || S.backfillLow === null || S.backfillLow <= 1) return 0;
   try {
-    const { events } = await chatBeforeRemote(S.backfillLow, limit);
+    const { events } = await fetchBefore(S.backfillLow, limit);
     return ingest(events);
-  } catch { return 0; }
+  } catch (err) { handleTransportError(err); return 0; }
 }
 
-/** Boot the chat engine: restore outbox, hook visibility, start passive polling. */
-export function initChat() {
-  loadOutbox();
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) poll();
+// ── Presence + read receipts ──────────────────────────────────────────────────
+function startPresence() {
+  if (S.presenceTimer) clearInterval(S.presenceTimer);
+  const beat = async () => {
+    if (!S.selfId || !isBackendConfigured() || (typeof document !== 'undefined' && document.hidden)) return;
+    try {
+      const { present } = await heartbeat(S.selfId, getLastSeen().seq);
+      S.presence = present;
+      let changed = false;
+      present.forEach(p => {
+        if ((S.seenMap[p.playerId] || 0) < (p.seen || 0)) { S.seenMap[p.playerId] = p.seen; changed = true; }
+      });
+      if (changed) { try { localStorage.setItem(K_SEENMAP, JSON.stringify(S.seenMap)); } catch {} }
+      notify('presence', { present });
+    } catch { /* presence is best-effort */ }
+  };
+  beat();
+  S.presenceTimer = setInterval(beat, 60000 + Math.random() * 10000);
+}
+export function presenceList() { return S.presence; }
+/** How many OTHER players are known to have seen a given seq. */
+export function seenByCount(seq, selfId) {
+  if (!seq) return 0;
+  return Object.entries(S.seenMap).filter(([pid, s]) => pid !== selfId && s >= seq).length;
+}
+
+// ── Unread (notifying events only — ambient never badges) ─────────────────────
+export function getLastSeen() {
+  try { return { seq: 0, byTag: {}, ...(JSON.parse(localStorage.getItem(K_LASTSEEN) || '{}')) }; }
+  catch { return { seq: 0, byTag: {} }; }
+}
+function putLastSeen(v) { try { localStorage.setItem(K_LASTSEEN, JSON.stringify(v)); } catch {} }
+
+export function markSeen(tag = 'all') {
+  const ls = getLastSeen();
+  if (tag === 'all') {
+    ls.seq = S.head;
+    Object.keys(ls.byTag).forEach(t => { ls.byTag[t] = S.head; });
+  } else {
+    ls.byTag[tag] = S.head;
+  }
+  putLastSeen(ls);
+  notify('seen', { tag });
+}
+
+function isUnreadFor(m, selfId, afterSeq) {
+  return m.type === 'message' && !m.deleted && m.notify &&
+         typeof m.seq === 'number' && m.seq > afterSeq && m.author !== selfId;
+}
+
+export function unreadCount(selfId, tag = 'all') {
+  const ls = getLastSeen();
+  const after = tag === 'all' ? ls.seq : (ls.byTag[tag] ?? ls.seq);
+  let n = 0;
+  S.items.forEach(m => {
+    if (tag !== 'all' && (m.gameTag || '') !== tag) return;
+    if (isUnreadFor(m, selfId, after)) n++;
   });
-  setPollMode('passive');
-  // First flush before first poll (outbox survives reload).
-  flushOutbox().finally(() => poll());
+  return n;
 }
 
-// ── Weekly digest export ──────────────────────────────────────────────────────
-/**
- * Structured digest of one week's chat, for recap generation.
- * `ctx` supplies league data the log can't know:
- *   { players:[{playerId,displayName}], games:[{gameId,homeTeam,awayTeam,kickoff}],
- *     atsLossesByPlayer: { playerId: [gameId,…] }, week }
- */
+export function mentionUnreadCount(selfId) {
+  const ls = getLastSeen();
+  return getMessages({ tag: 'all', mentionsOf: selfId }).filter(m => isUnreadFor(m, selfId, ls.seq)).length;
+}
+
+export function latestNotifying(selfId) {
+  let best = null;
+  S.items.forEach(m => {
+    if (m.type !== 'message' || m.deleted || !m.notify) return;
+    if (!best || orderKey(m) > orderKey(best)) best = m;
+  });
+  return best;
+}
+
+// ── Weekly digest (client-side — AD-13) ───────────────────────────────────────
 export function chatDigest(startMs, endMs, ctx = {}) {
   const players = ctx.players || [];
-  const nameOf = id => players.find(p => p.playerId === id)?.displayName || id;
-  const nameList = players.map(p => ({ id: p.playerId, name: (p.displayName || '').toLowerCase() }));
-  const inWindow = m => !m.deleted && m.type === 'message' && m.ts >= startMs && m.ts <= endMs;
-
-  const msgs = getChannelMessages('all').filter(inWindow);
+  const nameOf = pid => players.find(p => p.playerId === pid)?.displayName || pid;
+  const inRange = m => (m.ts || 0) >= startMs && (m.ts || 0) <= endMs;
+  const msgs = getMessages({ tag: 'all', types: ['message'] }).filter(m => inRange(m) && !m.deleted);
   const human = msgs.filter(m => m.author !== 'system' && m.author !== 'scribe');
 
-  // volume
-  const byPlayer = {}; const hourBuckets = {};
+  const byPlayer = {};
+  human.forEach(m => { byPlayer[m.author] = (byPlayer[m.author] || 0) + 1; });
+
+  // Peak hour + longest silence
+  const hours = {};
   human.forEach(m => {
-    byPlayer[nameOf(m.author)] = (byPlayer[nameOf(m.author)] || 0) + 1;
-    const h = new Date(m.ts); h.setMinutes(0, 0, 0);
-    const k = h.toISOString();
-    hourBuckets[k] = (hourBuckets[k] || 0) + 1;
+    const h = new Date(m.ts).toISOString().slice(0, 13) + ':00Z';
+    hours[h] = (hours[h] || 0) + 1;
   });
-  const peakHour = Object.entries(hourBuckets).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  const peakHour = Object.entries(hours).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
   let longestSilenceHours = null;
   if (human.length > 1) {
-    let maxGap = 0;
-    for (let i = 1; i < human.length; i++) maxGap = Math.max(maxGap, human[i].ts - human[i - 1].ts);
-    longestSilenceHours = Math.round(maxGap / 36e5 * 10) / 10;
+    let max = 0;
+    for (let i = 1; i < human.length; i++) max = Math.max(max, human[i].ts - human[i - 1].ts);
+    longestSilenceHours = Math.round(max / 3600000 * 10) / 10;
   }
 
-  // reactions
-  const reactionCount = m => Object.values(m.reactions).reduce((n, arr) => n + arr.length, 0);
-  const topReacted = [...human].map(m => ({ id: m.id, author: nameOf(m.author), body: m.body.slice(0, 200), reactionCount: reactionCount(m) }))
-    .filter(x => x.reactionCount > 0)
-    .sort((a, b) => b.reactionCount - a.reactionCount).slice(0, 10);
+  const reactionCount = m => Object.values(m.reactions || {}).reduce((a, v) => a + v.length, 0);
+  const topReacted = [...human].map(m => ({ id: m.id, author: m.author, body: m.body.slice(0, 200), reactionCount: reactionCount(m) }))
+    .filter(m => m.reactionCount > 0).sort((a, b) => b.reactionCount - a.reactionCount).slice(0, 10);
 
-  // mentions
   const mentions = {};
-  human.forEach(m => {
-    const low = m.body.toLowerCase();
-    nameList.forEach(({ id, name }) => {
-      if (id !== m.author && name && low.includes(name)) mentions[nameOf(id)] = (mentions[nameOf(id)] || 0) + 1;
-    });
-  });
+  human.forEach(m => (m.meta?.mentions || []).forEach(pid => { mentions[pid] = (mentions[pid] || 0) + 1; }));
 
-  // preBustBoast — msg by P pre-kick in game:G channel (or naming a G team), P lost G ATS
+  // preBustBoast: tagged (or team-named) message pre-kick by a player who lost that game ATS
   const games = ctx.games || [];
   const losses = ctx.atsLossesByPlayer || {};
   const preBustBoast = [];
   human.forEach(m => {
     const lostGames = losses[m.author] || [];
-    for (const gid of lostGames) {
-      const g = games.find(x => x.gameId === gid); if (!g) continue;
-      const kick = g.kickoff ? new Date(g.kickoff).getTime() : null;
-      if (!kick || m.ts >= kick) continue;
-      const inGameChan = m.channel === `game:${gid}`;
-      const namesTeam = [g.homeTeam, g.awayTeam].some(t => t && m.body.toLowerCase().includes(String(t).toLowerCase()));
-      if (inGameChan || namesTeam) {
-        preBustBoast.push({ author: nameOf(m.author), body: m.body.slice(0, 200), gameId: gid, ts: m.ts,
-          note: `posted pre-kick ${inGameChan ? 'in the game thread' : 'naming ' + g.homeTeam + '/' + g.awayTeam}; lost that game ATS` });
-        break;
-      }
+    let g = m.gameTag ? games.find(x => x.gameId === m.gameTag) : null;
+    if (!g) {
+      g = games.find(x => (losses[m.author] || []).includes(x.gameId) &&
+        (m.body.toLowerCase().includes((x.homeTeam || '').toLowerCase()) ||
+         m.body.toLowerCase().includes((x.awayTeam || '').toLowerCase())));
+    }
+    if (g && lostGames.includes(g.gameId) && g.kickoff && m.ts < new Date(g.kickoff).getTime()) {
+      preBustBoast.push({ author: m.author, body: m.body.slice(0, 200), gameId: g.gameId, ts: m.ts, id: m.id,
+        note: `posted pre-kick on ${g.awayTeam} @ ${g.homeTeam}; lost that game ATS` });
     }
   });
 
-  // beefs — two players naming each other within 5 minutes
+  // beefs: two players naming each other within 5 minutes
   const beefs = [];
   for (let i = 0; i < human.length; i++) {
-    for (let j = i + 1; j < human.length && human[j].ts - human[i].ts <= 5 * 60 * 1000; j++) {
+    for (let j = i + 1; j < human.length && human[j].ts - human[i].ts < 5 * 60000; j++) {
       const a = human[i], b = human[j];
       if (a.author === b.author) continue;
-      const aName = nameList.find(n => n.id === a.author)?.name;
-      const bName = nameList.find(n => n.id === b.author)?.name;
-      if (aName && bName && a.body.toLowerCase().includes(bName) && b.body.toLowerCase().includes(aName)) {
-        const key = [a.author, b.author].sort().join('|');
-        if (!beefs.some(x => x._k === key)) beefs.push({ _k: key, players: [nameOf(a.author), nameOf(b.author)], messageIds: [a.id, b.id] });
+      const aName = nameOf(a.author).toLowerCase(), bName = nameOf(b.author).toLowerCase();
+      if (a.body.toLowerCase().includes(bName) && b.body.toLowerCase().includes(aName)) {
+        beefs.push({ players: [a.author, b.author], messageIds: [a.id, b.id] });
       }
     }
   }
-  beefs.forEach(b => delete b._k);
 
-  const quotables = [...human]
-    .sort((a, b) => reactionCount(b) - reactionCount(a))
-    .slice(0, 10)
-    .map(m => ({ author: nameOf(m.author), body: m.body.slice(0, 200), ts: m.ts }));
+  // Engagement instrumentation (spec: decides whether push gets pulled forward)
+  const days = {};
+  human.forEach(m => { const d = new Date(m.ts).toISOString().slice(0, 10); (days[d] = days[d] || new Set()).add(m.author); });
+  const dau = Object.entries(days).map(([date, set]) => ({ date, players: set.size }));
+  const reacted = human.filter(m => reactionCount(m) > 0).length;
+  const replyGaps = [];
+  human.forEach(m => {
+    if (!m.replyTo) return;
+    const parent = S.items.get(m.replyTo);
+    if (parent?.ts) replyGaps.push((m.ts - parent.ts) / 60000);
+  });
+  replyGaps.sort((a, b) => a - b);
+  const medianReplyMinutes = replyGaps.length ? Math.round(replyGaps[Math.floor(replyGaps.length / 2)]) : null;
 
   return {
     week: ctx.week ?? null,
-    window: { start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString() },
-    volume: { byPlayer, peakHour, longestSilenceHours },
-    topReacted, mentions, preBustBoast, beefs, quotables,
+    volume: { byPlayer, peakHour, longestSilenceHours, total: human.length },
+    topReacted, mentions, preBustBoast, beefs,
+    quotables: topReacted.slice(0, 10).map(t => ({ author: t.author, body: t.body, id: t.id })),
+    engagement: {
+      dau,
+      reactionRate: human.length ? Math.round(reacted / human.length * 100) / 100 : 0,
+      medianReplyMinutes,
+    },
   };
 }
 
-// ── Test hooks (loadtest.mjs) ─────────────────────────────────────────────────
+// ── Test hooks ────────────────────────────────────────────────────────────────
 export function _resetForTest() {
-  S.events.clear(); S.messages.clear(); S.pendingByTarget.clear();
-  S.bySeq = []; S.head = 0; S.backfillLow = null; S.outbox = [];
-  S.pollFails = 0; S.offline = false; S.mode = 'idle';
-  if (S.timer) clearTimeout(S.timer);
+  S.items.clear(); S.buffered.clear(); S.head = 0; S.outbox = []; S.failed.clear();
+  S.offline = false; S.staleDeployment = false; S.presence = []; S.seenMap = {};
+  S.backfillLow = null; S.viewOpen = false;
 }
 export function _foldedSnapshot() {
-  // Deterministic serialization of the folded state for order-independence tests.
-  const msgs = getChannelMessages('all').map(m => ({
-    id: m.id, seq: m.seq, author: m.author, channel: m.channel, body: m.body,
-    edited: m.edited, deleted: m.deleted,
-    reactions: Object.fromEntries(Object.entries(m.reactions).map(([e, a]) => [e, [...a].sort()])),
+  const list = getMessages({ tag: 'all' }).map(m => ({
+    id: m.id, seq: m.seq, ts: m.ts, author: m.author, tag: m.gameTag, body: m.body,
+    edited: m.edited, deleted: m.deleted, pinned: m.pinned, notify: m.notify,
+    reactions: Object.fromEntries(Object.entries(m.reactions).map(([e, who]) => [e, [...who].sort()])),
   }));
-  msgs.sort((a, b) => (a.seq || 0) - (b.seq || 0) || a.id.localeCompare(b.id));
-  return JSON.stringify(msgs);
+  return JSON.stringify(list);
 }

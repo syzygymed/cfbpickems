@@ -27,7 +27,7 @@
 import { sendEvent } from './chat.js';
 
 const LEDGER_KEY = 'cfbp_scribe_ledger';   // { lineHash: lastUsedMs }
-const LAST_POST_KEY = 'cfbp_scribe_lastpost'; // { channel: lastMs }
+const LAST_POST_KEY = 'cfbp_scribe_lastpost'; // { rateKey: lastMs } ('' = main room, gameId = per-game)
 const REUSE_WINDOW_MS = 14 * 24 * 3600 * 1000;
 const GENERAL_COOLDOWN = 10 * 60 * 1000;
 const GAME_COOLDOWN = 60 * 60 * 1000;
@@ -35,6 +35,40 @@ const GAME_COOLDOWN = 60 * 60 * 1000;
 // ── Line pools ────────────────────────────────────────────────────────────────
 // {NAME} = display name of the subject player. {N} = a number when supplied.
 export const SCRIBE_POOLS = {
+  // ── v0.17.0: live-game observations (fed by the score poll) ──
+  coverageFlip: [
+    'SCRIBE NOTE: the number just changed sides. Adjust your blood pressure accordingly.',
+    'Coverage status has flipped. The chart is watching. So should you.',
+    'Live update: the spread and the scoreboard have exchanged positions. Documented.',
+    'Mid-game reversal noted. Several orders now in jeopardy. Filed.',
+    'The cover has changed hands. No further comment at this time.',
+  ],
+  upsetWatch: [
+    'SCRIBE NOTE: the underdog is not cooperating with your orders, gentlemen.',
+    'Upset conditions developing. The chart advises hydration.',
+    'The favorite is experiencing complications. Monitoring.',
+    'Documented at this time: {TEAM} did not read the number.',
+    'Adverse conditions on the field. Several charts affected. Filed.',
+  ],
+  callout: [
+    'Adverse event. Prior statement available for review.',
+    'The record reflects an earlier confidence. The scoreboard reflects otherwise.',
+    'For completeness, attaching the pre-game assessment to the post-game outcome.',
+    'Chart correlation complete: statement, then result. Filed without commentary.',
+    'One prior note is now clinically relevant. Presented as documented.',
+  ],
+  anniversary: [
+    'One year ago today, this was entered into the record. It remains there.',
+    'SCRIBE NOTE: annual chart review surfaced the following prior entry.',
+    'The permanent record observes an anniversary. Presented as filed.',
+    'Twelve months of documentation later, this entry stands unamended.',
+  ],
+  silence: [
+    'Chart is quiet. Unusual.',
+    'No entries in some time. The record notes the silence.',
+    'SCRIBE NOTE: vitals steady, room quiet. Documented.',
+    'The log has been idle. The standings have not moved either, for those wondering.',
+  ],
   mention: [
     'Chart review, gentlemen. The answer is in the standings.',
     'SCRIBE NOTE: I document. I do not consult. Filed.',
@@ -128,13 +162,13 @@ function saveLastPosts(l) { try { localStorage.setItem(LAST_POST_KEY, JSON.strin
 
 function hashLine(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; } return 'h' + (h >>> 0).toString(36); }
 
-function rateLimited(channel) {
-  const now = Date.now();
+function rateLimited(gameTag) {
   const lp = lastPosts();
-  const cooldown = channel === 'general' ? GENERAL_COOLDOWN : GAME_COOLDOWN;
-  return (now - (lp[channel] || 0)) < cooldown;
+  const key = gameTag || 'main';
+  const cooldown = gameTag ? GAME_COOLDOWN : GENERAL_COOLDOWN;
+  return Date.now() - (lp[key] || 0) < cooldown;
 }
-function noteRate(channel) { const lp = lastPosts(); lp[channel] = Date.now(); saveLastPosts(lp); }
+function noteRate(gameTag) { const lp = lastPosts(); lp[gameTag || 'main'] = Date.now(); saveLastPosts(lp); }
 
 function pickLine(poolKey, vars = {}) {
   const pool = SCRIBE_POOLS[poolKey] || [];
@@ -159,16 +193,20 @@ function bucket(ms = Date.now(), sizeMin = 10) { return Math.floor(ms / (sizeMin
  * `trigger`: key of SCRIBE_POOLS. `subject`: stable string identifying the event
  * (playerId, gameId…) — part of the deterministic id so six clients dedupe.
  */
-export function scribeTrigger(trigger, { channel = 'general', subject = '', vars = {}, bucketMin = 10 } = {}) {
+export function scribeTrigger(trigger, { gameTag = '', subject = '', vars = {}, bucketMin = 10, notify = false, quote = null } = {}) {
   if (!SCRIBE_POOLS[trigger]) return false;
-  if (rateLimited(channel)) return false;          // dropped, not queued
+  // Direct-mention replies bypass the rate limit (spec); everything else is
+  // rationed — the restraint IS the character.
+  const direct = trigger === 'mention';
+  if (!direct && rateLimited(gameTag)) return false;   // dropped, not queued
   const line = pickLine(trigger, vars);
   if (!line) return false;
   const id = `scribe_${trigger}_${subject || 'x'}_${bucket(Date.now(), bucketMin)}`
     .replace(/[^a-zA-Z0-9_:-]/g, '');
-  sendEvent({ type: 'message', channel, body: line, author: 'scribe', id,
-              meta: { source: 'tier0', trigger } });
-  noteRate(channel);
+  sendEvent({ type: 'message', gameTag, body: line, author: 'scribe', id,
+              notify: direct || notify,
+              meta: { source: 'tier0', trigger, ...(quote ? { quote } : {}) } });
+  if (!direct) noteRate(gameTag);
   return true;
 }
 
@@ -178,16 +216,16 @@ export function scribeTrigger(trigger, { channel = 'general', subject = '', vars
 
 const recentByAuthor = new Map();  // author -> [timestamps]
 
-export function scribeInspectMessage({ author, authorName, body, channel, standings = null }) {
+export function scribeInspectMessage({ author, authorName, body, gameTag = '', standings = null }) {
   const low = (body || '').toLowerCase();
 
   // 1. Direct @scribe mention with a question
   if (low.includes('@scribe')) {
-    return scribeTrigger('mention', { channel, subject: author, vars: { name: authorName } });
+    return scribeTrigger('mention', { gameTag, subject: author, vars: { name: authorName } });
   }
   // 2. Drink debt vocabulary
   if (/\bdrink|owes?\b|\bbalance|\bbeer|\bsapporo\b/.test(low)) {
-    return scribeTrigger('drinkDebt', { channel, subject: 'debt' });
+    return scribeTrigger('drinkDebt', { gameTag, subject: 'debt' });
   }
   // 3. Verbosity: >5 messages from one author in 2 minutes
   const now = Date.now();
@@ -195,12 +233,12 @@ export function scribeInspectMessage({ author, authorName, body, channel, standi
   arr.push(now); recentByAuthor.set(author, arr);
   if (arr.length > 5) {
     recentByAuthor.set(author, []);   // reset so it doesn't refire per message
-    return scribeTrigger('verbosity', { channel, subject: author, vars: { name: authorName, n: arr.length } });
+    return scribeTrigger('verbosity', { gameTag, subject: author, vars: { name: authorName, n: arr.length } });
   }
   // 4. Last place taunting first place (needs standings context)
   if (standings && standings.lastPlaceId === author && standings.firstPlaceName &&
       low.includes(standings.firstPlaceName.toLowerCase())) {
-    return scribeTrigger('lastPlaceTaunt', { channel, subject: author, vars: { name: authorName } });
+    return scribeTrigger('lastPlaceTaunt', { gameTag, subject: author, vars: { name: authorName } });
   }
   return false;
 }

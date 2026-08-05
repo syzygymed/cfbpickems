@@ -171,7 +171,7 @@ export const SITE_PIN_KEY = 'cfbp_site_unlocked';
 
 /**
  * Per-player theme catalog.
- *  - Default theme is 'aggie' (A&M maroon — matches the original Aggie Maroon palette).
+ *  - Default theme is 'neutral' (school-agnostic slate) as of v0.17.0; school palettes are opt-in.
  *  - Each theme is applied by adding a class `theme-<key>` to <body>, which the
  *    stylesheet uses to override the root CSS variables for primary brand colors.
  *  - Fonts stay constant across themes (Oswald + Inter).
@@ -179,13 +179,13 @@ export const SITE_PIN_KEY = 'cfbp_site_unlocked';
  */
 export const THEMES = [
   // key, label, classSuffix is the same as key
-  { key: 'aggie',     label: 'A&M (Maroon)',    school: 'Texas A&M', desc: 'Default' },
+  { key: 'aggie',     label: 'A&M (Maroon)',    school: 'Texas A&M' },
   { key: 'sooner',    label: 'Oklahoma (Crimson & Cream)', school: 'Oklahoma' },
   { key: 'trojan',    label: 'USC (Cardinal & Gold)',      school: 'USC' },
   { key: 'irish',     label: 'Notre Dame (Navy & Gold)',   school: 'Notre Dame' },
   { key: 'boilermaker', label: 'Purdue (Old Gold & Black)',school: 'Purdue' },
   { key: 'razorback', label: 'Arkansas (Cardinal)',        school: 'Arkansas' },
-  { key: 'neutral',   label: 'Neutral (Slate)',            school: null, desc: 'School-agnostic' },
+  { key: 'neutral',   label: 'Neutral (Slate)',            school: null, desc: 'Default' },
 ];
 
 // ─── DEFAULT RULES ────────────────────────────────────────────────────────────

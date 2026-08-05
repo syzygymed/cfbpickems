@@ -19,6 +19,7 @@ import {
 import { calculateSeasonStandings, calculateAtsWinner } from './scoring.js';
 import { formatWeekLabel } from './data-model.js';
 import { gradeWeekExtraPoint } from './extra-point.js';
+import { SEASON_2025, season2025Nets } from './history-2025.js';
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -27,7 +28,8 @@ function esc(s) {
 /** Most recent finalized, history-visible week strictly before `week` (same season first). */
 export function findPreviousFinalizedWeek(week) {
   const weeks = getWeeks().filter(w =>
-    w.status === 'final' && w.showInHistory !== false && w.weekId !== week?.weekId);
+    w.status === 'final' && w.showInHistory !== false && w.weekId !== week?.weekId &&
+    w.dataSourceMode !== 'demo');   // demo data never drives a recap (v0.17.0)
   if (!weeks.length) return null;
   const sameSeason = weeks
     .filter(w => w.season === week?.season && (week ? w.weekNumber < week.weekNumber : true))
@@ -138,9 +140,35 @@ export function renderWeekRecapCardHTML(prev) {
 export function renderSeasonSummaryHTML(currentWeek) {
   if (!currentWeek) return '';
   const season = currentWeek.season;
-  const priorWeeks = getWeeks().filter(w =>
-    w.season !== season && w.status === 'final' && w.showInHistory !== false);
   const blurb = (getSettings().seasonRecapText || '').trim();
+
+  // v0.17.0 — the 2K25 season of record is baked in (history-2025.js), so the
+  // Week-1 Permanent Record renders with ZERO commissioner setup. This was the
+  // root cause of the empty footer: the old path could only summarize prior
+  // seasons that lived in app storage, and 2K25 lived in a spreadsheet.
+  if (String(Number(season) - 1) === SEASON_2025.season) {
+    const nets = season2025Nets();
+    const fmtNet = n => (n > 0 ? `+${n}` : `${n}`);
+    return `
+    <div class="card mb-md recap-card recap-season">
+      <div class="recap-header">
+        <h3>📜 The Permanent Record — ${esc(SEASON_2025.label)}</h3>
+        <span class="recap-byline">retrieved by S.C.R.I.B.E.</span>
+      </div>
+      <div class="recap-line">👑 <strong>${esc(SEASON_2025.champion.name)}</strong> — ${SEASON_2025.champion.points} points, ${esc(SEASON_2025.champion.note)}. Champion of record.</div>
+      ${SEASON_2025.standings.map(s =>
+        `<div class="recap-line recap-standing"><span class="recap-rank">${s.rank}.</span> ${esc(s.name)} <span class="recap-alias">"${esc(s.alias)}"</span> — ${s.total}</div>`
+      ).join('')}
+      <div class="recap-line">🍺 Ledger carried into this season: ${Object.entries(nets).sort((a,b)=>b[1]-a[1]).map(([n,v]) => `${esc(n)} ${fmtNet(v)}`).join(' · ')} — all payable in person.</div>
+      <div class="recap-line">🎯 Extra Point champion: Jacob (4). Kevin finished at −1, which remains the only negative Extra Point total in league history.</div>
+      ${blurb ? `<div class="recap-blurb">${esc(blurb).replace(/\n/g, '<br>')}</div>` : ''}
+      <div class="recap-closer">The chart resets. The record does not. — SCRIBE</div>
+    </div>`;
+  }
+
+  const priorWeeks = getWeeks().filter(w =>
+    w.season !== season && w.status === 'final' && w.showInHistory !== false &&
+    w.dataSourceMode !== 'demo');
   if (!priorWeeks.length && !blurb) return '';
 
   let computed = '';

@@ -172,8 +172,28 @@ export function setTimezone(tzKey) {
   if (!_setPlayerPref('tz', tzKey)) saveSetting('timezone', tzKey);
 }
 
+// ── v0.17.0 chat identity + notification prefs (per-player, follow the person) ──
+export function getAccent() { return _playerPref('accent') || null; }
+export function setAccent(color) { _setPlayerPref('accent', color); }
+export function getChatNick() { return _playerPref('chatNick') || null; }
+export function setChatNick(nick) { _setPlayerPref('chatNick', (nick || '').slice(0, 16)); }
+export function getNotifPrefs() {
+  return { sound: false, toasts: true, systemEvents: true, ...(_playerPref('notif') || {}) };
+}
+export function setNotifPrefs(prefs) { _setPlayerPref('notif', { ...getNotifPrefs(), ...prefs }); }
+export function getAccentFor(playerId) {
+  const p = (load(KEYS.PLAYERS) || []).find(x => x.playerId === playerId);
+  return p?.preferences?.accent || null;
+}
+export function getChatNickFor(playerId) {
+  const p = (load(KEYS.PLAYERS) || []).find(x => x.playerId === playerId);
+  return p?.preferences?.chatNick || null;
+}
+
 export function getTheme() {
-  return _playerPref('theme') || getSettings().theme || 'aggie';
+  // v0.17.0 — league default is the school-agnostic neutral palette; players
+  // opt into school themes per their own preference.
+  return _playerPref('theme') || getSettings().theme || 'neutral';
 }
 export function setTheme(themeKey) {
   if (!_setPlayerPref('theme', themeKey)) saveSetting('theme', themeKey);
@@ -624,6 +644,7 @@ export function saveObligation(ob){
   if(idx>=0)all[idx]=ob;else all.push(ob);
   save(KEYS.OBLIGATIONS,all);
 }
+export function saveAllObligations(list){ save(KEYS.OBLIGATIONS, list || []); }
 export function createObligation(weekId,payerPlayerId,recipientPlayerId,prize,type='weekly'){
   return{
     obligationId:`ob_${Date.now()}_${Math.random().toString(36).slice(2,5)}`,

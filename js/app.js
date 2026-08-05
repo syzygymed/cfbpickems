@@ -4,8 +4,8 @@
  * One-stop place to update the user-visible version string + release date.
  * Surfaced in the footer of the Rules tab (Priority 12).
  */
-export const APP_VERSION = 'v0.16.0';
-export const APP_VERSION_DATE = '2026-08-04';
+export const APP_VERSION = 'v0.17.0';
+export const APP_VERSION_DATE = '2026-08-05';
 
 
 import {
@@ -33,7 +33,7 @@ import {
   getAvailableGames, saveAvailableGames, clearAvailableGames,
   getPicks, getPick, saveAllPicks, hasPlayerSubmitted,
   getWeeklyResults, saveAllWeeklyResults,
-  getObligations, saveObligation, createObligation,
+  getObligations, saveObligation, saveAllObligations, createObligation,
   getNickname, setNickname, getDisplayNamePlain,
   getGameLockOverrides, setGameLockOverride, clearAllLockOverrides,
   getTiebreakerGuess, setTiebreakerGuess, getTiebreakerGuesses,
@@ -81,9 +81,12 @@ import {
   initChatUI, renderChatPage, gameChatBubbleHTML, dashboardChatTeaserHTML,
   updateChatBadges, openGameChatSheet, setChatChannel,
   emitPicksLockedEvent, emitGameFinalEvent, emitExtraPointEvent, emitWeekFinalEvent,
+  emitPickRevealEvent, emitKickoffEvent, scribeLiveGameCheck,
   chatDigest,
 } from './chat-ui.js';
-import { setPollMode } from './chat.js';
+import { setPollMode, sendEvent as sendChatEvent, sendGameReact } from './chat.js';
+import { SEASON_2025, season2025Obligations, season2025Nets } from './history-2025.js';
+import { fetchMetrics as fetchChatMetrics } from './chatTransport.js';
 import { renderPicksFooterHTML, renderWeekRecapCardHTML } from './recap.js';
 import {
   detectLongestFieldGoal, gradeWeekExtraPoint, gradeExtraPoint,
@@ -268,13 +271,31 @@ function setupNav() {
   document.querySelectorAll('.nav-item').forEach(i => i.addEventListener('click', () => navigateTo(i.dataset.tab)));
 }
 
+/** v0.17.0 — THE PICK REVEAL RITUAL. When the current week's effective status
+ *  crosses into locked, one system event posts everyone's picks to the room
+ *  simultaneously. Local ledger prevents outbox spam; the deterministic id
+ *  (sys_reveal_<weekId>) makes it exactly-once across all six clients. */
+function checkPickRevealDue() {
+  const week = getCurrentWeek(); if (!week || week.dataSourceMode==='demo') return;
+  const eff = getEffectiveWeekStatus(week);
+  if (!['locked','live','final'].includes(eff) && week.status!=='final') return;
+  const key = 'cfbp_reveal_emitted';
+  let done = [];
+  try { done = JSON.parse(localStorage.getItem(key) || '[]'); } catch {}
+  if (done.includes(week.weekId)) return;
+  emitPickRevealEvent(week);
+  done.push(week.weekId);
+  try { localStorage.setItem(key, JSON.stringify(done.slice(-20))); } catch {}
+}
+
 function navigateTo(tab) {
   state.currentTab = tab;
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.querySelectorAll('.page-section').forEach(el => el.classList.toggle('active', el.id === `page-${tab}`));
   ({ picks: renderPicksPage, dashboard: renderDashboard, leaderboard: renderLeaderboard, commissioner: renderCommPage, rules: renderRulesPage, chat: renderChatPage })[tab]?.();
-  // Chat polls fast only while the chat tab is open (v0.16.0)
+  // Chat polls fast only while the chat tab is open
   try { setPollMode(tab === 'chat' ? 'active' : 'passive'); updateChatBadges(); } catch {}
+  try { checkPickRevealDue(); } catch {}
 }
 
 function refreshHeader() {
@@ -311,7 +332,7 @@ function fmtTime(iso, game=null) { return formatGameTime(iso, tz(), game); }
 // ─── THEME ────────────────────────────────────────────────────────────────────
 // Applies a theme by replacing the `theme-*` class on <body>. Idempotent.
 function applyTheme(themeKey) {
-  const key = themeKey || getTheme() || 'aggie';
+  const key = themeKey || getTheme() || 'neutral';
   const body = document.body;
   [...body.classList].forEach(c => { if (c.startsWith('theme-')) body.classList.remove(c); });
   body.classList.add('theme-' + key);
@@ -413,7 +434,9 @@ function renderPicksPage() {
 
 /** Weeks a player may browse on the Picks tab: current week + anything locked/live/final. */
 function picksNavWeeks() {
-  const weeks = getWeeks().filter(w => w.showInHistory !== false && w.status !== WEEK_STATUS.DRAFT);
+  const cur = getCurrentWeek();
+  const weeks = getWeeks().filter(w => w.showInHistory !== false && w.status !== WEEK_STATUS.DRAFT &&
+    (w.dataSourceMode !== 'demo' || w.weekId === cur?.weekId));
   return weeks.sort((a, b) => String(a.season).localeCompare(String(b.season)) || a.weekNumber - b.weekNumber);
 }
 
@@ -1549,7 +1572,8 @@ function bindReactionHandlers(players) {
       const session = getSession();
       if (!session?.playerId) { showToast('Log in as a player to react','warning'); return; }
       const { weekId, gameId, emoji } = btn.dataset;
-      toggleReaction(weekId, gameId, emoji, session.playerId);
+      const after = toggleReaction(weekId, gameId, emoji, session.playerId);
+      if (after.includes(session.playerId)) { try { sendGameReact(gameId, emoji, session.playerId); } catch {} }
       refreshReactionStrip(weekId, gameId, players);
     });
   });
@@ -1572,7 +1596,8 @@ function bindReactionHandlers(players) {
           ev.stopPropagation();
           const session = getSession();
           if (!session?.playerId) { showToast('Log in to react','warning'); picker.remove(); return; }
-          toggleReaction(weekId, gameId, opt.dataset.emoji, session.playerId);
+          const after = toggleReaction(weekId, gameId, opt.dataset.emoji, session.playerId);
+          if (after.includes(session.playerId)) { try { sendGameReact(gameId, opt.dataset.emoji, session.playerId); } catch {} }
           picker.remove();
           refreshReactionStrip(weekId, gameId, players);
         });
@@ -1853,10 +1878,11 @@ function renderDashboardCompact(players, games, allPicks, weeklyResults, weekId,
 function renderLeaderboard() {
   const c=document.getElementById('page-leaderboard'); if(!c)return;
   const players=getPlayers().filter(p=>p.active);
-  const visibleWeekIds=new Set(getWeeks().filter(w=>w.showInHistory!==false).map(w=>w.weekId));
+  // v0.17.0 — demo weeks never count toward standings, weekly history, or debts
+  const visibleWeekIds=new Set(getWeeks().filter(w=>w.showInHistory!==false&&w.dataSourceMode!=='demo').map(w=>w.weekId));
   const allResults=getWeeklyResults().filter(r=>visibleWeekIds.has(r.weekId));
   const standings=calculateSeasonStandings(players,allResults);
-  const weeks=getWeeks().filter(w=>w.status!==WEEK_STATUS.DRAFT).sort((a,b)=>a.weekNumber-b.weekNumber);
+  const weeks=getWeeks().filter(w=>w.status!==WEEK_STATUS.DRAFT&&w.dataSourceMode!=='demo').sort((a,b)=>a.weekNumber-b.weekNumber);
   const settings=getSettings();
   const obligations=getObligations();
 
@@ -1919,8 +1945,12 @@ function renderLeaderboard() {
         </tbody>
       </table>
     </div>`:'<p class="text-muted text-sm mb-md">Weekly history appears after weeks are finalized.</p>'}
+
+    ${renderSeason2025OutstandingSection()}
+    ${renderSeason2025RecordSection()}
   `;
 
+  bindSeason2025Sections(c);
   c.querySelectorAll('.mark-paid-standings-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
       const ob=getObligations().find(o=>o.obligationId===btn.dataset.obId); if(!ob)return;
@@ -2373,11 +2403,29 @@ function renderCommPage() {
         </div>
       </div>`);
 
-    // Obligations
+    // Obligations (v0.17.0: manual add/delete + the 2K25 carryover ledger)
     sections.push(`
       <div class="admin-section" data-comm-tab="players">
         <div class="admin-section-title">Obligations</div>
-        <div class="card">${renderObligationsAdmin()}</div>
+        <div class="card mb-md">${renderObligationsAdmin()}
+          <div class="divider"></div>
+          <div class="form-group"><label class="form-label" style="font-size:.7rem">Add an obligation manually</label>
+            <div class="flex gap-sm flex-wrap" style="align-items:flex-end">
+              <select class="form-select" id="ob-add-payer" style="width:auto">${players.map(p=>`<option value="${p.playerId}">${escHtml(p.displayName)}</option>`).join('')}</select>
+              <span class="text-muted text-xs">owes</span>
+              <select class="form-select" id="ob-add-recipient" style="width:auto">${players.map(p=>`<option value="${p.playerId}">${escHtml(p.displayName)}</option>`).join('')}</select>
+              <input class="form-input" id="ob-add-note" placeholder="what & why (e.g. 1 drink — side bet)" style="flex:1;min-width:160px" />
+              <button class="btn btn-primary btn-sm" id="ob-add-btn">Add</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="flex" style="justify-content:space-between;align-items:baseline">
+            <strong style="font-size:.85rem">🍺 2K25 carryover ledger</strong>
+            <span class="text-muted text-xs">14 weekly drinks + 1 bonus, all unpaid — from the audited season report</span>
+          </div>
+          ${renderSeason2025ObligationsAdmin()}
+        </div>
       </div>`);
 
     // Auto-refresh
@@ -3632,7 +3680,44 @@ function bindCommEventListeners(week, games, availGames, suggested, settings, al
     showToast(`✉ Opening mail client for ${recipients.length} recipient${recipients.length>1?'s':''}`,'success');
   });
 
-  // Obligations
+  // Obligations (v0.17.0: manual add / delete / undo / 2K25 ledger / demo purge)
+  document.getElementById('ob-add-btn')?.addEventListener('click',()=>{
+    const payer=document.getElementById('ob-add-payer')?.value;
+    const recip=document.getElementById('ob-add-recipient')?.value;
+    const note=(document.getElementById('ob-add-note')?.value||'').trim();
+    if(!payer||!recip||payer===recip){showToast('Pick two different players','error');return;}
+    const ob=createObligation(null,payer,recip,note||'1 drink','manual');
+    ob.note=note||'manual entry'; ob.weekLabel='manual';
+    saveObligation(ob);
+    showToast('✅ Obligation added','success'); renderCommPage();
+  });
+  document.querySelectorAll('.ob-delete-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      if(!confirm('Delete this obligation from the ledger?'))return;
+      saveAllObligations(getObligations().filter(o=>o.obligationId!==btn.dataset.obId));
+      showToast('🗑 Obligation deleted','success'); renderCommPage();
+    });
+  });
+  document.querySelectorAll('.mark-unpaid-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const ob=getObligations().find(o=>o.obligationId===btn.dataset.obId); if(!ob)return;
+      saveObligation({...ob,status:'unpaid',paidAt:null});
+      renderCommPage();
+    });
+  });
+  document.getElementById('ob-purge-demo')?.addEventListener('click',()=>{
+    const demoIds=new Set(getWeeks().filter(w=>w.dataSourceMode==='demo').map(w=>w.weekId));
+    saveAllObligations(getObligations().filter(o=>!demoIds.has(o.weekId)));
+    showToast('🧹 Demo obligations purged','success'); renderCommPage();
+  });
+  document.querySelectorAll('.ob2025-toggle').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const map={...(getSettings().ob2025||{})};
+      map[btn.dataset.obId]=!map[btn.dataset.obId];
+      saveSetting('ob2025',map);
+      renderCommPage();
+    });
+  });
   document.querySelectorAll('.mark-paid-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
       const ob=getObligations().find(o=>o.obligationId===btn.dataset.obId); if(!ob)return;
@@ -3985,24 +4070,121 @@ function renderTiebreakerGuessesAdmin(weekId, players, actualTB) {
     </div>`;
 }
 
+function currentSeasonObligations() {
+  // v0.17.0 — demo-week obligations are excluded everywhere; anything a demo
+  // finalize created in the past is invisible and purgeable below.
+  const demoIds = new Set(getWeeks().filter(w=>w.dataSourceMode==='demo').map(w=>w.weekId));
+  return getObligations().filter(o=>!demoIds.has(o.weekId) && !String(o.obligationId).startsWith('ob_2025_'));
+}
+
+/** v0.17.0 — 2K25 outstanding balances, visible to the whole league on the
+ *  Standings tab. Paid-state syncs via settings.ob2025 (commissioner or the
+ *  payer can mark). Collapsible so the current season stays front and center. */
+function renderSeason2025OutstandingSection() {
+  const paidMap = getSettings().ob2025 || {};
+  const rows = season2025Obligations();
+  const openRows = rows.filter(r => !paidMap[r.obligationId]);
+  const nets = season2025Nets();
+  const fmtNet = n => n > 0 ? `+${n}` : `${n}`;
+  const sess = getSession();
+  return `
+    <div class="admin-section-title">🍺 2K25 Outstanding Balances</div>
+    <div class="card mb-md">
+      <p class="text-muted text-xs mb-sm">${openRows.length} of ${rows.length} drinks from last season remain unpaid. Per league bylaw: settled IN PERSON only. Net position: ${Object.entries(nets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`${escHtml(n)} ${fmtNet(v)}`).join(' · ')}.</p>
+      ${openRows.length ? openRows.map(r => {
+        const canMark = sess.isAdmin || sess.playerId === r.payerPlayerId;
+        return `<div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border)">
+          <div class="text-sm"><strong>${escHtml(r.payerName)}</strong> owes <strong>${escHtml(r.recipientName)}</strong> — ${escHtml(r.prize)}
+            <span class="text-xs text-muted">(${escHtml(r.weekLabel)})</span></div>
+          ${canMark ? `<button class="btn btn-win btn-sm ob2025-standings-toggle" data-ob-id="${r.obligationId}">Mark Paid</button>` : ''}
+        </div>`;
+      }).join('') : '<p class="text-muted text-sm">All settled. The ledger rests — for now.</p>'}
+    </div>`;
+}
+
+/** v0.17.0 — the CFP 2K25 season of record, permanently browsable. */
+function renderSeason2025RecordSection() {
+  const wkNames = Object.keys(SEASON_2025.weeklyScores);
+  return `
+    <div class="admin-section-title">📜 Historical Record — ${escHtml(SEASON_2025.label)}</div>
+    <div class="card mb-md">
+      <details>
+        <summary style="cursor:pointer;font-weight:600;font-size:.85rem">🏆 ${escHtml(SEASON_2025.champion.name)} — ${SEASON_2025.champion.points} pts · full season record (tap to expand)</summary>
+        <div class="dashboard-scroll" style="margin-top:10px">
+          <table class="dashboard-table">
+            <thead><tr><th>Rk</th><th>Player</th><th>Reg</th><th>EP</th><th>Conf ×2</th><th>Bowls</th><th>R1 ×2</th><th>QF ×2</th><th>Semis ×3</th><th>Total</th></tr></thead>
+            <tbody>${SEASON_2025.standings.map(s=>`<tr>
+              <td>${s.rank}</td><td class="player-name-cell">${escHtml(s.name)} <span class="text-xs text-muted">"${escHtml(s.alias)}"</span></td>
+              <td>${s.reg}</td><td>${s.extraPt}</td><td>${s.conf}</td><td>${s.bowls}</td><td>${s.cfpR1}</td><td>${s.cfpQF}</td><td>${s.semis??'DNP'}</td><td><strong>${s.total}</strong></td>
+            </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div class="dashboard-scroll" style="margin-top:10px">
+          <table class="dashboard-table">
+            <thead><tr><th>Player</th>${Array.from({length:14},(_,i)=>`<th>${i+1}</th>`).join('')}<th>Reg</th></tr></thead>
+            <tbody>${wkNames.map(n=>{
+              const arr=SEASON_2025.weeklyScores[n];
+              return `<tr><td class="player-name-cell">${escHtml(n)}</td>${arr.map(v=>`<td>${v}</td>`).join('')}<td><strong>${arr.reduce((a,b)=>a+b,0)}</strong></td></tr>`;
+            }).join('')}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px">${SEASON_2025.superlatives.map(s=>`<div class="recap-line"><strong>${escHtml(s.label)}:</strong> ${escHtml(s.value)}</div>`).join('')}</div>
+        <p class="text-muted text-xs" style="margin-top:8px">${SEASON_2025.notes.map(escHtml).join(' · ')}</p>
+      </details>
+    </div>`;
+}
+
+function bindSeason2025Sections(c) {
+  c.querySelectorAll('.ob2025-standings-toggle').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const map={...(getSettings().ob2025||{})};
+      map[btn.dataset.obId]=true;
+      saveSetting('ob2025',map);
+      showToast('✅ Marked paid — the 2K25 ledger thins','success');
+      renderLeaderboard();
+    });
+  });
+}
+
 function renderObligationsAdmin() {
-  const obs=getObligations(); const players=getPlayers(); const settings=getSettings();
-  if(!obs.length)return'<p class="text-muted text-sm">No obligations yet.</p>';
-  return obs.map(ob=>{
+  const obs=currentSeasonObligations(); const players=getPlayers(); const settings=getSettings();
+  const demoCount = getObligations().length - obs.length - getObligations().filter(o=>String(o.obligationId).startsWith('ob_2025_')).length;
+  const purge = demoCount>0 ? `<div class="info-box mb-sm">🧹 ${demoCount} demo-week obligation${demoCount>1?'s':''} hidden. <button class="btn btn-ghost btn-sm" id="ob-purge-demo">Purge permanently</button></div>` : '';
+  if(!obs.length)return purge+'<p class="text-muted text-sm">No obligations this season — the slate is clean until Week 1 finalizes.</p>';
+  return purge + obs.map(ob=>{
     const payer=players.find(p=>p.playerId===ob.payerPlayerId);
     const recip=players.find(p=>p.playerId===ob.recipientPlayerId);
     const w=getWeek(ob.weekId);
     return`<div class="flex-between" style="padding:8px 0;border-bottom:1px solid var(--border)">
       <div>
         <div class="text-sm"><strong>${escHtml(payer?.displayName||'?')}</strong> owes <strong>${escHtml(recip?.displayName||'?')}</strong></div>
-        <div class="text-xs text-muted">${escHtml(formatWeekLabel(w))} · ${escHtml(ob.amountOrPrize||settings.weeklyPrize)}</div>
+        <div class="text-xs text-muted">${escHtml(ob.weekId ? formatWeekLabel(w) : (ob.weekLabel||'manual'))} · ${escHtml(ob.note||ob.amountOrPrize||settings.weeklyPrize)}</div>
       </div>
       <div class="flex gap-sm">
         <span class="badge ${ob.status==='paid'?'badge-open':ob.status==='waived'?'badge-final':'badge-locked'}">${ob.status}</span>
-        ${ob.status!=='paid'?`<button class="btn btn-win btn-sm mark-paid-btn" data-ob-id="${ob.obligationId}">Mark Paid</button>`:''}
+        ${ob.status!=='paid'?`<button class="btn btn-win btn-sm mark-paid-btn" data-ob-id="${ob.obligationId}">Mark Paid</button>`
+          :`<button class="btn btn-ghost btn-sm mark-unpaid-btn" data-ob-id="${ob.obligationId}">Undo</button>`}
+        <button class="btn btn-ghost btn-sm ob-delete-btn" data-ob-id="${ob.obligationId}" title="Delete">🗑</button>
       </div>
     </div>`;
   }).join('');
+}
+
+/** v0.17.0 — the 2K25 carryover ledger. Paid-state lives in settings.ob2025
+ *  so the baked history data stays immutable and paid-marks sync cross-device. */
+function renderSeason2025ObligationsAdmin() {
+  const paidMap = getSettings().ob2025 || {};
+  const rows = season2025Obligations();
+  const open = rows.filter(r=>!paidMap[r.obligationId]).length;
+  return `<div class="text-xs text-muted mb-sm">${open} of ${rows.length} still outstanding · payable IN PERSON only</div>` +
+    rows.map(r=>{
+      const paid = !!paidMap[r.obligationId];
+      return `<div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border)">
+        <div><div class="text-sm"><strong>${escHtml(r.payerName)}</strong> owes <strong>${escHtml(r.recipientName)}</strong> — ${escHtml(r.prize)}</div>
+          <div class="text-xs text-muted">${escHtml(r.weekLabel)}${r.note?` · ${escHtml(r.note)}`:''}</div></div>
+        <button class="btn ${paid?'btn-ghost':'btn-win'} btn-sm ob2025-toggle" data-ob-id="${r.obligationId}">${paid?'Paid ✓ (undo)':'Mark Paid'}</button>
+      </div>`;
+    }).join('');
 }
 
 function renderCommLogin(c) {
@@ -4445,13 +4627,14 @@ function renderRulesPage() {
       </div>
     </div>
 
-    <!-- v0.16.0 — Chat rules -->
+    <!-- v0.17.0 — Chat rules -->
     <div class="card mb-md">
       <div class="rules-section"><h3>💬 League Chat</h3>
         <ul class="rules-list">
-          <li>One running thread for the league, plus a thread per game (💬 on any game card) and a weekly thread.</li>
-          <li>React, reply, edit your own messages within 5 minutes, withdraw with a tombstone. The log is append-only — SCRIBE keeps the receipts.</li>
-          <li><strong>S.C.R.I.B.E.</strong> lives in the chat. It documents lock times, finals, busts, and outstanding balances. Summon it with @scribe at your own risk.</li>
+          <li><strong>One room.</strong> Everything happens in the main chat. Any message can be tagged to a game — tap 💬 on a game card and your post shows up both in that game's thread and in the room. Replies inherit the tag, so conversations stay findable. Untag with one tap if the talk drifts.</li>
+          <li>React, reply, pin to the 🏛 Hall of Records, edit your own messages within 5 minutes, withdraw with a tombstone. The log is append-only.</li>
+          <li>At lock, the room gets <strong>the reveal</strong> — everyone's picks posted at once. Game finals, standings, and Extra Point results file in automatically. Nothing ever leaks a pick before lock.</li>
+          <li><strong>S.C.R.I.B.E. is the seventh member of this league.</strong> Records custodian, attending physician of the chart. It documents lock times, adverse events, live-game complications, and outstanding balances on its own schedule — and it answers when addressed. It is not summoned. It is on duty.</li>
           <li>House rule, inherited and non-negotiable: savage about football, never about real life.</li>
         </ul>
       </div>
@@ -4560,6 +4743,10 @@ function submitFeedback() {
 // ─── v0.16.0 COMMISSIONER EXTRAS (Extra Point + Chat / SCRIBE) ────────────────
 
 function renderCommExtrasV16(week, games) {
+  // v0.17.0 FIX — these cards previously appended UNWRAPPED to the page
+  // container, so they showed on EVERY comm tab and after the demo panel.
+  // Now: Extra Point lives in the Week tab (inserted BEFORE Demo Simulation,
+  // which stays last per league preference); Chat & SCRIBE lives in Settings.
   const c = document.getElementById('page-commissioner'); if (!c || !week) return;
   const session = getSession();
   if (!session.isAdmin) return;
@@ -4571,7 +4758,8 @@ function renderCommExtrasV16(week, games) {
     return `<span class="ep-admin-guess">${escHtml(p.displayName)}: <strong>${g == null ? '—' : g + ' yd'}</strong></span>`;
   }).join(' ');
 
-  c.insertAdjacentHTML('beforeend', `
+  const epHTML = `
+    <div class="admin-section" data-comm-tab="week">
     <div class="card mb-md" id="comm-ep-card">
       <h3 style="color:var(--maroon)">🎯 Ischemic Extra Point — ${escHtml(formatWeekLabel(week))}</h3>
       <p class="text-muted text-xs">Longest made FG on the slate, blackjack rules. Detect pulls per-game scoring plays from ESPN; you can always override manually.</p>
@@ -4591,7 +4779,16 @@ function renderCommExtrasV16(week, games) {
       </div>
       <div id="ep-graded-preview">${graded ? renderExtraPointResultsHTML(week, graded, escHtml) : ''}</div>
     </div>
+    </div>`;
+  // Insert the Extra Point card BEFORE the Demo Simulation section so the demo
+  // panel remains the LAST item in the Week tab.
+  const demoSection = [...c.querySelectorAll('.admin-section[data-comm-tab="week"]')]
+    .find(s => s.textContent.includes('Demo Simulation'));
+  if (demoSection) demoSection.insertAdjacentHTML('beforebegin', epHTML);
+  else c.insertAdjacentHTML('beforeend', epHTML);
 
+  c.insertAdjacentHTML('beforeend', `
+    <div class="admin-section" data-comm-tab="settings">
     <div class="card mb-md" id="comm-chat-card">
       <h3 style="color:var(--maroon)">📋 Chat &amp; S.C.R.I.B.E.</h3>
       <p class="text-muted text-xs">Tier 0 (deterministic lines) runs automatically with rate limits. Tier 1 lets you paste a reviewed batch of SCRIBE posts. The digest feeds recap generation.</p>
@@ -4612,6 +4809,18 @@ function renderCommExtrasV16(week, games) {
         <textarea class="form-input" id="season-recap-input" rows="3">${escHtml(getSettings().seasonRecapText || '')}</textarea>
       </div>
       <button class="btn btn-secondary btn-sm" id="season-recap-save">Save blurb</button>
+      <div class="divider"></div>
+      <div class="mb-sm"><strong style="font-size:.8rem">🩺 Chat diagnostics</strong>
+        <p class="text-muted text-xs">Tests the deployed Apps Script for the chat endpoints — the v0.16 outage was an out-of-date deployment, which this detects in one click.</p>
+        <div class="flex gap-sm flex-wrap">
+          <button class="btn btn-secondary btn-sm" id="chat-diag-btn">Run test</button>
+          <span class="text-muted text-xs" id="chat-diag-out"></span>
+        </div>
+      </div>
+      <div class="mb-sm"><strong style="font-size:.8rem">📈 Backend load (last 7 days)</strong>
+        <div id="chat-metrics-out" class="text-muted text-xs">—</div>
+      </div>
+    </div>
     </div>`);
 
   // ── handlers ──
@@ -4679,10 +4888,10 @@ function renderCommExtrasV16(week, games) {
         const at = item.postAt ? new Date(item.postAt).getTime() : 0;
         if (at && at > now) { deferred++; return; }   // scheduling proper lands with Tier 1
         if (!item.body) return;
-        import('./chat.js').then(m => m.sendEvent({
-          type: 'message', channel: item.channel || 'general', body: String(item.body),
+        sendChatEvent({
+          type: 'message', gameTag: item.gameTag || '', body: String(item.body),
           author: 'scribe', meta: { source: 'tier1' },
-        }));
+        });
         posted++;
       });
       if (st) st.textContent = `✅ Posted ${posted}` + (deferred ? ` · ${deferred} future-dated skipped (scheduling ships with Tier 1)` : '');
@@ -4693,6 +4902,34 @@ function renderCommExtrasV16(week, games) {
     saveSetting('seasonRecapText', document.getElementById('season-recap-input')?.value || '');
     showToast('✅ Season recap blurb saved', 'success');
   });
+
+  document.getElementById('chat-diag-btn')?.addEventListener('click', async () => {
+    const out = document.getElementById('chat-diag-out');
+    if (out) out.textContent = '⏳ testing…';
+    try {
+      const mod = await import('./chatTransport.js');
+      const { head } = await mod.fetchHead();
+      if (out) out.textContent = `✅ Chat backend OK — head at seq ${head}. Deployment is current.`;
+    } catch (e) {
+      if (out) out.textContent = e?.stale
+        ? '❌ DEPLOYMENT OUT OF DATE — the deployed Apps Script has no chat endpoints. Paste the new Code.gs, then Deploy → Manage deployments → Edit → New version (same URL).'
+        : '❌ ' + (e.message || e);
+    }
+  });
+
+  (async () => {
+    const out = document.getElementById('chat-metrics-out');
+    if (!out) return;
+    try {
+      const { rows } = await fetchChatMetrics(7);
+      if (!rows.length) { out.textContent = 'No metrics yet — they accrue once chat traffic starts.'; return; }
+      out.innerHTML = rows.map(r => {
+        const total = r.execCount || 0;
+        const warn = total > 2500 ? ' style="color:#B02A37;font-weight:700"' : total > 1600 ? ' style="color:#B8860B;font-weight:600"' : '';
+        return `<span${warn}>${escHtml(r.date)}: ${total} calls (${r.appendCount||0} sends, ${r.headHit||0}/${(r.headHit||0)+(r.headMiss||0)} head cache hits)</span>`;
+      }).join(' · ');
+    } catch { out.textContent = 'Metrics unavailable (older deployment or offline).'; }
+  })();
 }
 
 // ─── FINALIZATION ─────────────────────────────────────────────────────────────
@@ -4731,7 +4968,10 @@ function finalizeWeek(week) {
   if(winner&&loser){
     const existing=getObligations(week.weekId);
     if(!existing.find(o=>o.type==='weekly'))
-      saveObligation(createObligation(week.weekId,loser.playerId,winner.playerId,settings.weeklyPrize));
+      // v0.17.0 — demo weeks NEVER generate real obligations
+      if (week.dataSourceMode !== 'demo') {
+        saveObligation(createObligation(week.weekId,loser.playerId,winner.playerId,settings.weeklyPrize));
+      }
   }
 }
 
@@ -4780,7 +5020,14 @@ async function doRefreshScores(week,games) {
     const stored=getGame(upd.gameId);
     if(!stored) continue;
     const wasFinal = stored.status===GAME_STATUS.FINAL;
+    const wasLive  = stored.status===GAME_STATUS.LIVE;
     saveGame({...stored,homeScore:upd.homeScore,awayScore:upd.awayScore,status:upd.status,actualWinner:upd.actualWinner,lastUpdated:upd.lastUpdated});
+    // v0.17.0 — kickoff system event + SCRIBE live observations
+    try {
+      const fresh0=getGame(upd.gameId);
+      if (!wasLive && !wasFinal && upd.status===GAME_STATUS.LIVE) emitKickoffEvent(fresh0);
+      if (upd.status===GAME_STATUS.LIVE) scribeLiveGameCheck(stored, fresh0);
+    } catch(e){ console.warn('[refresh] live events', e); }
     // v0.16.0 — a game just went FINAL: post the ATS result to its chat thread.
     if (!wasFinal && upd.status===GAME_STATUS.FINAL) {
       try {

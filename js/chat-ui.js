@@ -1,37 +1,60 @@
 /**
- * CFB Pickems — Chat UI (v0.16.0, Part B)
- * ========================================
- * Renders every chat surface from the chat.js core:
- *   A. Full chat page (#page-chat): channel pills → All / General / Week N / game threads
- *   B. Composer: 1000-char cap, @mentions, quick emoji, reply quoting
- *   C. Game-card comment sheet (bottom sheet, scoped to game:<id>)
- *   D. Nav unread badge + dashboard teaser card
- *   E. System-event emitters (with the pre-lock no-leak HARD RULE)
+ * chat-ui.js — v0.17.0 (REVISED chat spec: one room + gameTag)
+ * =============================================================
+ * Renders every chat surface from the chat.js engine:
+ *   A. Main chat page — single stream, filter pills (Room / 🏛 Records /
+ *      @ Mentions / per-game views with unread + LIVE pulse), date separators,
+ *      NEW divider, jump-to-latest, ambient gamereact coalescing
+ *   B. Composer — removable game-tag chip (the cross-talk rule made visible),
+ *      @mention autocomplete, quick emoji, 1000-char counter
+ *   C. Game-card bubble + pre-tagged bottom sheet (+ first-use helper text)
+ *   D. Dashboard sticky bar — unread, preview, inline quick-reply
+ *   E. In-app notifications (TRIAL, no push): toast queue, title badge,
+ *      navigator.setAppBadge, mention inbox, optional per-player sound
+ *   F. Identity: per-player nickname + accent color (prefs popover)
+ *   G. System emitters — pick reveal ritual, kickoff, game final (+ one-tap
+ *      callout + SCRIBE unprompted callout), Extra Point, week final (+ Hall
+ *      of Records auto-promotion), all with the pre-lock no-leak HARD RULE
+ *   H. SCRIBE — an active member of the league, not a summonable bot: it
+ *      documents on its own schedule, appears in presence, and answers when
+ *      addressed. Live-game observations ride the existing score poll.
  *
- * All state lives in chat.js; this module only renders + forwards intents.
+ * All state lives in chat.js; this module renders and forwards intents.
  */
 
 import {
-  initChat, onChat, chatStatus, getChannelMessages, getActiveChannels, getMessage,
-  sendEvent, retryFailed, outboxStateOf, unreadCount, markSeen, setPollMode,
-  backfill, newId, chatDigest, poll,
+  initChat, onChat, chatStatus, getMessages, getMessage, resolveTag,
+  sendMessage, sendEvent, editMessage, deleteMessage, toggleReact, pinMessage,
+  sendGameReact, retryFailed, isFailed, isPending,
+  unreadCount, mentionUnreadCount, markSeen, getLastSeen, latestNotifying,
+  presenceList, seenByCount, backfill, chatDigest as _digest, setViewOpen,
 } from './chat.js';
 import { scribeInspectMessage, scribeTrigger } from './scribeLines.js';
 import {
-  getSession, getPlayers, getPlayer, getCurrentWeek, getGames, getWeeklyResults,
-  getPicks, getWeeks,
+  getSession, getPlayers, getPlayer, getCurrentWeek, getGames, getWeeks,
+  getPicks, getEffectiveWeekStatus,
+  getAccent, setAccent, getAccentFor, getChatNick, setChatNick, getChatNickFor,
+  getNotifPrefs, setNotifPrefs,
 } from './storage.js';
-import { formatSpread, formatWeekLabel } from './data-model.js';
-import { calculateSeasonStandings } from './scoring.js';
+import { formatSpread, formatWeekLabel, GAME_STATUS } from './data-model.js';
+import { calculateAtsWinner } from './scoring.js';
+
+export const chatDigest = _digest;
 
 const QUICK_EMOJI = ['💀', '😂', '🔥', '🍺', '🤡', '👀'];
 const EDIT_WINDOW_MS = 5 * 60 * 1000;
+const ACCENTS = ['#B91C1C', '#C2410C', '#A16207', '#15803D', '#0E7490', '#1D4ED8', '#7C3AED', '#BE185D'];
 
-let _uiState = {
-  channel: 'all',          // active channel in the full chat page
-  replyTo: null,           // message id being replied to
-  sheetGameId: null,       // open game bottom-sheet
+const U = {
+  filter: 'all',            // 'all' | 'records' | 'mentions' | <gameId>
+  replyTo: null,
+  composerTag: '',          // resolved tag chip (removable)
+  tagStripped: false,       // user explicitly removed the chip this compose
+  sheetGameId: null,
   markTimer: null,
+  toastQueue: [],
+  toastShowing: false,
+  prefsOpen: false,
 };
 
 function esc(s) {
@@ -40,13 +63,18 @@ function esc(s) {
 function me() { const s = getSession(); return (s?.playerId && s?.playerVerified) ? s.playerId : null; }
 function nameOf(id) {
   if (id === 'scribe') return 'S.C.R.I.B.E.';
-  if (id === 'system') return 'System';
-  return getPlayer(id)?.displayName || id;
+  if (id === 'system') return 'League';
+  return getChatNickFor(id) || getPlayer(id)?.displayName || id;
 }
 function initialsOf(id) {
   if (id === 'scribe') return '📋';
   if (id === 'system') return '⚙';
-  return getPlayer(id)?.initials || (nameOf(id).slice(0, 2).toUpperCase());
+  const n = nameOf(id);
+  return (getPlayer(id)?.initials || n.slice(0, 2)).toUpperCase();
+}
+function accentOf(id) {
+  if (id === 'scribe' || id === 'system') return '';
+  return getAccentFor(id) || '';
 }
 function relTime(ts) {
   if (!ts) return 'sending…';
@@ -56,488 +84,906 @@ function relTime(ts) {
   if (d < 86400e3) return Math.floor(d / 3600e3) + 'h';
   return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
-
-// ── Channel helpers ───────────────────────────────────────────────────────────
-
-function channelLabel(channel) {
-  if (channel === 'general') return 'General';
-  if (channel === 'all') return 'All';
-  if (channel.startsWith('week:')) {
-    const wk = getWeeks().find(w => w.weekId === channel.slice(5));
-    return wk ? formatWeekLabel(wk) : channel.slice(5);
+function gameById(id) {
+  for (const w of getWeeks()) {
+    const g = getGames(w.weekId).find(x => x.gameId === id);
+    if (g) return { game: g, week: w };
   }
-  if (channel.startsWith('game:')) {
-    const g = getGames().find(x => x.gameId === channel.slice(5));
-    if (!g) return 'Game';
-    return `${g.awayTeam} @ ${g.homeTeam}`;
-  }
-  return channel;
+  return null;
+}
+function gameShort(g) {
+  const abbr = t => (t || '').split(' ').pop().slice(0, 12);
+  return `${abbr(g.awayTeam)}/${abbr(g.homeTeam)}`;
+}
+function chatPageActive() {
+  return typeof document !== 'undefined' && !!document.querySelector('#page-chat.active');
 }
 
-function gameChipHTML(channel) {
-  if (!channel?.startsWith('game:')) return '';
-  const g = getGames().find(x => x.gameId === channel.slice(5));
-  if (!g) return '';
-  const spread = formatSpread(g.lockedSpread ?? g.spread, g.favorite, g);
-  return `<button class="chat-game-chip" data-chan="${esc(channel)}">🏈 ${esc(g.awayTeam)} @ ${esc(g.homeTeam)}${spread ? ' · ' + esc(spread) : ''}</button>`;
+// ── Pick indicator (Drew: visual context in game threads) ─────────────────────
+// BLIND RULE: only shown once the week is locked/live/final — never leaks a
+// selection while picks are open.
+function pickChip(authorId, gameTag) {
+  if (!gameTag || authorId === 'scribe' || authorId === 'system') return '';
+  const found = gameById(gameTag);
+  if (!found) return '';
+  const eff = getEffectiveWeekStatus(found.week);
+  if (!['locked', 'live', 'final'].includes(eff) && found.week.status !== 'final') return '';
+  const pick = getPicks(found.week.weekId, authorId).find(p => p.gameId === gameTag);
+  if (!pick) return '';
+  let cls = 'pick-chip';
+  if (found.game.status === GAME_STATUS.FINAL) {
+    const ats = found.game.atsWinner ?? calculateAtsWinner(found.game);
+    if (ats && ats !== 'no_decision') cls += pick.selectedTeam === ats ? ' pick-chip-win' : ' pick-chip-loss';
+  }
+  return `<span class="${cls}" title="${esc(nameOf(authorId))} picked ${esc(pick.selectedTeam)}">⚡ ${esc(pick.selectedTeam.split(' ').pop())}</span>`;
+}
+
+// ── Notifications (TRIAL — no push) ───────────────────────────────────────────
+function playBlip() {
+  try {
+    if (!getNotifPrefs().sound) return;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = 740; o.type = 'sine';
+    g.gain.setValueAtTime(0.06, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+    o.connect(g).connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.2);
+  } catch {}
+}
+
+function showToast(msg, { force = false } = {}) {
+  if (!force && !getNotifPrefs().toasts) return;
+  if (chatPageActive() && !force) return;            // suppress while chat focused
+  U.toastQueue.push(msg);
+  if (!U.toastShowing) drainToast();
+}
+function drainToast() {
+  const msg = U.toastQueue.shift();
+  if (!msg) { U.toastShowing = false; return; }
+  U.toastShowing = true;
+  document.getElementById('chat-toast')?.remove();
+  const el = document.createElement('div');
+  el.id = 'chat-toast';
+  el.className = 'chat-toast';
+  el.innerHTML = `<span class="chat-toast-avatar" style="${accentOf(msg.author) ? `background:${accentOf(msg.author)};color:#fff` : ''}">${esc(initialsOf(msg.author))}</span>
+    <span class="chat-toast-body"><strong>${esc(nameOf(msg.author))}</strong> ${esc((msg.body || '').slice(0, 80))}</span>`;
+  el.addEventListener('click', () => { el.remove(); U.toastShowing = false; navToChat(); });
+  document.body.appendChild(el);
+  setTimeout(() => { el.remove(); setTimeout(drainToast, 250); }, 6000);
+}
+function navToChat() {
+  document.querySelector('.nav-item[data-tab="chat"]')?.click();
+}
+
+export function updateChatBadges() {
+  const self = me();
+  const n = self ? unreadCount(self, 'all') : 0;
+  // nav badge
+  document.querySelectorAll('.nav-item[data-tab="chat"]').forEach(btn => {
+    let b = btn.querySelector('.nav-unread');
+    if (n > 0) {
+      if (!b) { b = document.createElement('span'); b.className = 'nav-unread'; btn.appendChild(b); }
+      b.textContent = n > 99 ? '99+' : String(n);
+    } else b?.remove();
+  });
+  // title badge
+  try {
+    const base = document.title.replace(/^\(\d+\+?\)\s*/, '');
+    document.title = n > 0 ? `(${n > 99 ? '99+' : n}) ${base}` : base;
+  } catch {}
+  // installed-PWA icon badge (not push — no permissions, degrades silently)
+  try {
+    if ('setAppBadge' in navigator) n > 0 ? navigator.setAppBadge(n) : navigator.clearAppBadge();
+  } catch {}
+}
+
+// ── Filter pills ──────────────────────────────────────────────────────────────
+function activeGameTags() {
+  // Games worth a pill: any tagged traffic, or live games on the current slate.
+  const tags = new Map();   // gameId -> lastTs
+  getMessages({ tag: 'all' }).forEach(m => {
+    if (m.gameTag) tags.set(m.gameTag, Math.max(tags.get(m.gameTag) || 0, m.ts || 0));
+  });
+  const wk = getCurrentWeek();
+  if (wk) getGames(wk.weekId).forEach(g => {
+    if (g.status === GAME_STATUS.LIVE && !tags.has(g.gameId)) tags.set(g.gameId, Date.now());
+  });
+  return [...tags.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id).slice(0, 10);
+}
+
+function pillsHTML() {
+  const self = me();
+  const mainUnread = self ? unreadCount(self, 'all') : 0;
+  const mentions = self ? mentionUnreadCount(self) : 0;
+  const dot = n => n > 0 ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : '';
+  let html = `
+    <button class="chat-pill${U.filter === 'all' ? ' active' : ''}" data-chat-filter="all">Room ${dot(mainUnread)}</button>
+    <button class="chat-pill${U.filter === 'records' ? ' active' : ''}" data-chat-filter="records" title="Hall of Records">🏛</button>
+    <button class="chat-pill${U.filter === 'mentions' ? ' active' : ''}" data-chat-filter="mentions" title="Mentions & replies to you">@ ${dot(mentions)}</button>`;
+  activeGameTags().forEach(tag => {
+    const found = gameById(tag);
+    if (!found) return;
+    const live = found.game.status === GAME_STATUS.LIVE;
+    const n = self ? unreadCount(self, tag) : 0;
+    html += `<button class="chat-pill${U.filter === tag ? ' active' : ''}${live ? ' chat-pill-live' : ''}" data-chat-filter="${esc(tag)}">
+      ${live ? '<span class="live-pulse"></span>' : ''}${esc(gameShort(found.game))} ${dot(n)}</button>`;
+  });
+  return `<div class="chat-pills-scroll">${html}</div>`;
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
+function bodyHTML(m) {
+  let t = esc(m.body);
+  t = t.replace(/@([A-Za-z][\w.']*)/g, '<span class="chat-mention">@$1</span>');
+  return t;
+}
 
-function renderMessageHTML(m, { showChip = false } = {}) {
-  const my = me();
-  const mine = m.author === my;
-  const outbox = outboxStateOf(m.id);   // 'pending' | 'failed' | null
-  const kind = m.author === 'scribe' ? 'scribe' : (m.type === 'system' || m.author === 'system') ? 'system' : (mine ? 'mine' : 'theirs');
-
-  if (kind === 'system') {
-    return `<div class="chat-msg chat-system" data-id="${esc(m.id)}">
-      <span class="chat-system-body">${esc(m.body)}</span>
-      <span class="chat-time">${relTime(m.ts)}</span>
-    </div>`;
+function quoteHTML(m) {
+  const q = m.meta?.quote;
+  if (q) {
+    return `<div class="chat-reply-quote chat-quote-static">↩ <strong>${esc(nameOf(q.author))}</strong>: ${esc((q.body || '').slice(0, 120))}</div>`;
   }
+  if (!m.replyTo) return '';
+  const parent = getMessage(m.replyTo);
+  if (!parent) return '';
+  return `<button class="chat-reply-quote" data-jump="${esc(parent.id)}">↩ <strong>${esc(nameOf(parent.author))}</strong>: ${esc((parent.deleted ? 'message withdrawn' : parent.body).slice(0, 90))}</button>`;
+}
 
-  const body = m.deleted
-    ? '<em class="chat-tombstone">message withdrawn</em>'
-    : esc(m.body).replace(/@(\w[\w.'-]*)/g, '<span class="chat-mention">@$1</span>');
+function reactionsHTML(m, self) {
+  const entries = Object.entries(m.reactions || {});
+  if (!entries.length) return '';
+  return `<div class="chat-reactions">${entries.map(([emoji, who]) =>
+    `<button class="chat-react-pill${who.includes(self) ? ' me' : ''}" data-react="${esc(emoji)}" data-target="${esc(m.id)}"
+       title="${esc(who.map(nameOf).join(', '))}">${emoji} ${who.length}</button>`).join('')}</div>`;
+}
 
-  const replyQuote = m.replyTo ? (() => {
-    const parent = getMessage(m.replyTo);
-    if (!parent) return '';
-    return `<button class="chat-reply-quote" data-target="${esc(parent.id)}">↩ ${esc(nameOf(parent.author))}: ${esc((parent.deleted ? 'message withdrawn' : parent.body).slice(0, 80))}</button>`;
-  })() : '';
+function tagChipHTML(m) {
+  if (!m.gameTag || U.filter === m.gameTag) return '';
+  const found = gameById(m.gameTag);
+  if (!found) return '';
+  const spr = formatSpread(found.game.lockedSpread ?? found.game.spread, found.game.favorite, found.game) || '';
+  return `<button class="chat-game-chip" data-chat-filter="${esc(m.gameTag)}">${esc(gameShort(found.game))}${spr ? ' ' + esc(spr) : ''}</button>`;
+}
 
-  const reactions = Object.entries(m.reactions).map(([emoji, who]) =>
-    `<button class="chat-react-pill ${who.includes(my) ? 'me' : ''}" data-id="${esc(m.id)}" data-emoji="${esc(emoji)}" title="${esc(who.map(nameOf).join(', '))}">${emoji} ${who.length}</button>`).join('');
+function calloutEligible(m) {
+  // One-tap callout: tagged message, game final, posted pre-kick, author lost it ATS
+  if (!m.gameTag || m.type !== 'message' || m.deleted) return false;
+  const found = gameById(m.gameTag);
+  if (!found || found.game.status !== GAME_STATUS.FINAL) return false;
+  const ats = found.game.atsWinner ?? calculateAtsWinner(found.game);
+  if (!ats || ats === 'no_decision') return false;
+  const pick = getPicks(found.week.weekId, m.author).find(p => p.gameId === m.gameTag);
+  if (!pick || pick.selectedTeam === ats) return false;
+  return found.game.kickoff && (m.ts || 0) < new Date(found.game.kickoff).getTime();
+}
 
-  const canEdit = mine && !m.deleted && m.ts && (Date.now() - m.ts) < EDIT_WINDOW_MS;
-  const actions = m.deleted ? '' : `
-    <div class="chat-actions">
-      ${QUICK_EMOJI.slice(0, 3).map(e => `<button class="chat-act" data-act="react" data-id="${esc(m.id)}" data-emoji="${e}">${e}</button>`).join('')}
-      <button class="chat-act" data-act="reply" data-id="${esc(m.id)}">↩</button>
-      ${canEdit ? `<button class="chat-act" data-act="edit" data-id="${esc(m.id)}">✏️</button>` : ''}
-      ${mine ? `<button class="chat-act" data-act="delete" data-id="${esc(m.id)}">🗑</button>` : ''}
-    </div>`;
+function messageHTML(m, self, showNewDivider) {
+  if (m.type === 'system') {
+    const reveal = m.meta?.kind === 'reveal';
+    return `${showNewDivider ? '<div class="chat-new-divider"><span>NEW</span></div>' : ''}
+      <div class="chat-msg chat-system${reveal ? ' chat-reveal' : ''}" data-mid="${esc(m.id)}">
+        <div class="chat-system-body">${reveal ? `<div class="chat-reveal-title">🔓 ${esc(m.meta?.title || 'Picks are in')}</div>` : ''}${bodyHTML(m).replace(/\n/g, '<br>')}</div>
+        <span class="chat-time">${relTime(m.ts)}</span>
+      </div>`;
+  }
+  if (m.type === 'gamereact') return '';   // rendered via coalescing pass
 
-  const status = outbox === 'failed'
-    ? `<span class="chat-failed">FAILED <button class="chat-retry" data-id="${esc(m.id)}">retry</button></span>`
-    : (outbox === 'pending' ? '<span class="chat-pending">🕓</span>' : '');
+  const mine = m.author === self;
+  const scribe = m.author === 'scribe';
+  const failed = isFailed(m.id);
+  const pending = isPending(m.id);
+  const canEdit = mine && !m.deleted && Date.now() - (m.ts || 0) < EDIT_WINDOW_MS;
+  const accent = accentOf(m.author);
+  const seen = mine && m.seq ? seenByCount(m.seq, self) : 0;
 
-  return `
-    <div class="chat-msg chat-${kind} ${outbox === 'pending' ? 'is-pending' : ''} ${outbox === 'failed' ? 'is-failed' : ''}" data-id="${esc(m.id)}">
-      <div class="chat-avatar chat-avatar-${kind}">${esc(initialsOf(m.author))}</div>
-      <div class="chat-bubble-col">
-        <div class="chat-meta"><span class="chat-author">${esc(nameOf(m.author))}</span>
-          ${showChip ? gameChipHTML(m.channel) : ''}
-          <span class="chat-time">${relTime(m.ts)}</span>${m.edited ? '<span class="chat-edited">edited</span>' : ''}${status}</div>
-        ${replyQuote}
-        <div class="chat-bubble">${body}</div>
-        <div class="chat-reactions">${reactions}</div>
-        ${actions}
+  return `${showNewDivider ? '<div class="chat-new-divider"><span>NEW</span></div>' : ''}
+  <div class="chat-msg${mine ? ' chat-mine' : ''}${scribe ? ' chat-scribe' : ''}${pending ? ' is-pending' : ''}${failed ? ' is-failed' : ''}" data-mid="${esc(m.id)}">
+    <div class="chat-avatar${scribe ? ' chat-avatar-scribe' : ''}${mine ? ' chat-avatar-mine' : ''}" ${accent ? `style="background:${accent};color:#fff"` : ''}>${initialsOf(m.author)}</div>
+    <div class="chat-bubble-col">
+      <div class="chat-meta">
+        <span class="chat-author">${esc(nameOf(m.author))}</span>
+        ${pickChip(m.author, m.gameTag)}
+        ${tagChipHTML(m)}
+        <span class="chat-time">${relTime(m.ts)}</span>
+        ${m.edited ? '<span class="chat-edited">edited</span>' : ''}
+        ${m.pinned ? '<span class="chat-pinned">📌</span>' : ''}
+        ${pending ? '<span class="chat-pending">🕐</span>' : ''}
+        ${failed ? `<span class="chat-failed">FAILED</span><button class="chat-retry" data-retry="${esc(m.id)}">retry</button>` : ''}
       </div>
-    </div>`;
+      ${quoteHTML(m)}
+      <div class="chat-bubble">${m.deleted ? '<span class="chat-tombstone">🪦 message withdrawn</span>' : bodyHTML(m).replace(/\n/g, '<br>')}</div>
+      ${reactionsHTML(m, self)}
+      ${mine && seen > 0 ? `<div class="chat-seen">seen by ${seen}</div>` : ''}
+      ${m.deleted ? '' : `<div class="chat-actions">
+        ${QUICK_EMOJI.slice(0, 3).map(e => `<button class="chat-act" data-react="${e}" data-target="${esc(m.id)}">${e}</button>`).join('')}
+        <button class="chat-act" data-reply="${esc(m.id)}" title="Reply">↩</button>
+        ${calloutEligible(m) ? `<button class="chat-act" data-callout="${esc(m.id)}" title="Quote this next to the result">📎</button>` : ''}
+        <button class="chat-act" data-pin="${esc(m.id)}" title="${m.pinned ? 'Unpin from' : 'Pin to'} the Hall of Records">${m.pinned ? '📌' : '🏛'}</button>
+        ${canEdit ? `<button class="chat-act" data-edit="${esc(m.id)}" title="Edit (5 min)">✏️</button>` : ''}
+        ${mine ? `<button class="chat-act" data-del="${esc(m.id)}" title="Withdraw">🗑</button>` : ''}
+      </div>`}
+    </div>
+  </div>`;
 }
 
-function renderMessageListHTML(channel) {
-  const msgs = getChannelMessages(channel);
-  if (!msgs.length) {
-    return `<div class="chat-empty">📋 Nothing on the chart yet.<br><span class="text-muted text-xs">Say something. SCRIBE is listening.</span></div>`;
+/** Ambient coalescing: consecutive gamereacts by one author within 5 min render
+ *  as a single attributed line (attribution is the whole point in a 6-man room). */
+function coalesceStream(list) {
+  const out = [];
+  let run = null;
+  const flush = () => { if (run) { out.push(run); run = null; } };
+  for (const m of list) {
+    if (m.type === 'gamereact') {
+      if (run && run.author === m.author && (m.ts - run.lastTs) < 5 * 60000) {
+        run.items.push(m); run.lastTs = m.ts;
+      } else {
+        flush();
+        run = { kind: 'gamereact-run', author: m.author, ts: m.ts, lastTs: m.ts, items: [m] };
+      }
+    } else { flush(); out.push(m); }
   }
-  const my = me();
-  const seen = my ? (unreadCount(my, channel === 'all' ? null : channel) > 0) : false;
-  let lastDay = '';
-  let html = '';
-  msgs.forEach(m => {
-    const day = m.ts ? new Date(m.ts).toDateString() : '';
-    if (day && day !== lastDay) {
-      lastDay = day;
-      html += `<div class="chat-day-sep">${new Date(m.ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</div>`;
-    }
-    html += renderMessageHTML(m, { showChip: channel === 'all' && m.channel !== 'general' });
-  });
-  return html;
+  flush();
+  return out;
 }
 
-// ── Full chat page ────────────────────────────────────────────────────────────
+function gamereactRunHTML(run) {
+  const parts = run.items.map(m => {
+    const found = gameById(m.gameTag);
+    return `${esc(m.meta?.emoji || '👀')} ${found ? esc(gameShort(found.game)) : ''}`;
+  }).join(' · ');
+  return `<div class="chat-msg chat-system chat-gamereact" data-ts="${run.ts}">
+    <div class="chat-system-body">${esc(nameOf(run.author))} reacted &nbsp;${parts}</div>
+    <span class="chat-time">${relTime(run.ts)}</span>
+  </div>`;
+}
 
+// ── Main chat page ────────────────────────────────────────────────────────────
 export function renderChatPage() {
   const c = document.getElementById('page-chat'); if (!c) return;
-  const my = me();
-  const week = getCurrentWeek();
-  const chan = _uiState.channel;
+  const self = me();
+  const st = chatStatus();
+  setViewOpen(true);
 
-  // Channel pills: All · General · Week N · active game threads (most recent first)
-  const pills = [
-    { id: 'all', label: 'All' },
-    { id: 'general', label: 'General' },
-  ];
-  if (week) pills.push({ id: `week:${week.weekId}`, label: formatWeekLabel(week) });
-  getActiveChannels().forEach(({ channel }) => {
-    if (channel.startsWith('game:') && !pills.some(p => p.id === channel)) {
-      pills.push({ id: channel, label: channelLabel(channel) });
+  let list;
+  if (U.filter === 'records') list = getMessages({ tag: 'all', pinned: true });
+  else if (U.filter === 'mentions') list = self ? getMessages({ tag: 'all', mentionsOf: self }) : [];
+  else if (U.filter === 'all') list = getMessages({ tag: 'all' });
+  else list = getMessages({ tag: U.filter });
+
+  const showSys = getNotifPrefs().systemEvents;
+  if (!showSys) list = list.filter(m => m.type !== 'system');
+
+  const ls = getLastSeen();
+  const boundary = U.filter === 'all' ? ls.seq : (ls.byTag[U.filter] ?? ls.seq);
+  let dividerPlaced = false;
+
+  const stream = coalesceStream(list);
+  let lastDay = '';
+  let msgsHTML = '';
+  for (const item of stream) {
+    const ts = item.ts || Date.now();
+    const day = new Date(ts).toDateString();
+    if (day !== lastDay) { msgsHTML += `<div class="chat-day-sep">${esc(day)}</div>`; lastDay = day; }
+    if (item.kind === 'gamereact-run') { msgsHTML += gamereactRunHTML(item); continue; }
+    const isNew = !dividerPlaced && self && item.type === 'message' && item.notify &&
+                  typeof item.seq === 'number' && item.seq > boundary && item.author !== self;
+    if (isNew) dividerPlaced = true;
+    msgsHTML += messageHTML(item, self, isNew);
+  }
+  if (!stream.length) {
+    msgsHTML = `<div class="chat-empty">${U.filter === 'records'
+      ? 'The Hall of Records awaits its first entry. Pin a message with 🏛.'
+      : U.filter === 'mentions' ? 'No mentions or replies yet.'
+      : 'The room is open. SCRIBE is on duty.'}</div>`;
+  }
+
+  // Header context for game views
+  let viewHeader = '';
+  if (!['all', 'records', 'mentions'].includes(U.filter)) {
+    const found = gameById(U.filter);
+    if (found) {
+      const g = found.game;
+      const score = g.homeScore != null ? `${g.awayScore}–${g.homeScore}` : '';
+      viewHeader = `<div class="chat-view-header">
+        <div><strong>${esc(g.awayTeam)} @ ${esc(g.homeTeam)}</strong>
+          <span class="text-muted text-xs">${esc(formatSpread(g.lockedSpread ?? g.spread, g.favorite, g) || '')}</span></div>
+        <div>${g.status === GAME_STATUS.LIVE ? `<span class="live-pulse"></span> LIVE ${score}` : score}</div>
+      </div>`;
     }
-  });
+  }
 
-  const pillHTML = pills.map(p => {
-    const n = my ? unreadCount(my, p.id === 'all' ? null : p.id) : 0;
-    return `<button class="chat-pill ${chan === p.id ? 'active' : ''}" data-chan="${esc(p.id)}">
-      ${esc(p.label)}${n ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : ''}</button>`;
-  }).join('');
+  const here = presenceList().filter(p => p.playerId !== self);
+  const presenceLine = `${here.length ? `${here.length + (self ? 1 : 0)} here now · ` : ''}📋 SCRIBE on duty`;
 
-  const status = chatStatus();
-  const offlineBanner = status.offline
-    ? '<div class="chat-offline-banner">⚠️ CHAT OFFLINE — messages are not syncing. Retrying…</div>' : '';
-
-  const composerTarget = chan === 'all' ? 'general' : chan;
-  const composer = my ? `
-    <div class="chat-composer">
-      ${_uiState.replyTo ? (() => {
-        const p = getMessage(_uiState.replyTo);
-        return p ? `<div class="chat-replying">↩ Replying to <strong>${esc(nameOf(p.author))}</strong>: ${esc(p.body.slice(0, 60))} <button id="chat-cancel-reply">✕</button></div>` : '';
-      })() : ''}
-      ${chan === 'all' ? `<div class="chat-target-note">Posting to <strong>${esc(channelLabel(composerTarget))}</strong></div>` : ''}
-      <div class="chat-composer-row">
-        <textarea id="chat-input" class="chat-input" rows="1" maxlength="1000"
-          placeholder="Message ${esc(channelLabel(composerTarget))}… (@scribe to summon the bot)"></textarea>
-        <button class="chat-send-btn" id="chat-send-btn">➤</button>
-      </div>
-      <div class="chat-composer-foot">
-        <span class="chat-emoji-row">${QUICK_EMOJI.map(e => `<button class="chat-emoji-insert" data-e="${e}">${e}</button>`).join('')}</span>
-        <span class="chat-char-count" id="chat-char-count"></span>
-      </div>
-    </div>`
-    : `<div class="chat-login-note">🔒 Log in on the Picks tab to join the chat. Reading is open to the league.</div>`;
+  const banner = st.offline ? `<div class="chat-offline-banner">⚠️ CHAT OFFLINE — ${st.staleDeployment
+    ? 'the backend deployment is out of date. Commissioner: open Apps Script → Deploy → Manage deployments → Edit → <b>New version</b>, then reload.'
+    : `messages are not syncing. Retrying… <span class="text-xs">(${esc(st.lastError || '')})</span>`}</div>` : '';
 
   c.innerHTML = `
-    <div class="section-header"><h2>💬 League Chat</h2>
-      <div class="subtitle">One thread. Every game. SCRIBE is in the room.</div></div>
-    ${offlineBanner}
-    <div class="chat-pills-scroll">${pillHTML}</div>
-    <div class="chat-scroll" id="chat-scroll">
-      <button class="chat-load-older" id="chat-load-older">↑ Load older</button>
-      ${renderMessageListHTML(chan)}
+    <div class="section-header chat-header-row">
+      <div><h2>League Chat</h2><div class="subtitle">${esc(presenceLine)}</div></div>
+      <button class="btn btn-ghost btn-sm" id="chat-prefs-btn" title="Chat preferences">⚙️</button>
     </div>
-    ${composer}`;
+    ${U.prefsOpen ? prefsPanelHTML() : ''}
+    ${banner}
+    ${pillsHTML()}
+    ${viewHeader}
+    <div class="chat-scroll" id="chat-scroll">
+      <button class="chat-load-older" id="chat-load-older">↑ load earlier</button>
+      ${msgsHTML}
+    </div>
+    <button class="chat-jump-latest" id="chat-jump" style="display:none">↓ latest</button>
+    ${self ? composerHTML() : `<div class="chat-login-note">Log in on the Picks tab to join the conversation. Reading is open to the league.</div>`}
+  `;
 
-  bindChatPage(composerTarget);
+  bindChatPage();
   const scroll = document.getElementById('chat-scroll');
   if (scroll) scroll.scrollTop = scroll.scrollHeight;
 
-  // Mark-as-read after the channel is visibly open for 1s
-  if (_uiState.markTimer) clearTimeout(_uiState.markTimer);
-  if (my) _uiState.markTimer = setTimeout(() => { markSeen(my, chan); updateChatBadges(); }, 1000);
+  // Mark read after the view has been visibly open for 1s (spec)
+  clearTimeout(U.markTimer);
+  U.markTimer = setTimeout(() => {
+    if (!chatPageActive()) return;
+    markSeen(U.filter === 'all' || U.filter === 'records' || U.filter === 'mentions' ? 'all' : U.filter);
+    updateChatBadges();
+    renderPillsOnly();
+  }, 1000);
 }
 
-function bindChatPage(composerTarget) {
-  const c = document.getElementById('page-chat');
-  c.querySelectorAll('.chat-pill').forEach(b => b.addEventListener('click', () => {
-    _uiState.channel = b.dataset.chan; _uiState.replyTo = null; renderChatPage();
-  }));
-  document.getElementById('chat-load-older')?.addEventListener('click', async (e) => {
-    e.target.textContent = 'Loading…';
-    await backfill(100);
-    renderChatPage();
+function renderPillsOnly() {
+  const host = document.querySelector('#page-chat .chat-pills-scroll');
+  if (host) host.outerHTML = pillsHTML();
+  bindFilterButtons(document.getElementById('page-chat'));
+}
+
+// ── Composer ──────────────────────────────────────────────────────────────────
+function composerHTML() {
+  const replyMsg = U.replyTo ? getMessage(U.replyTo) : null;
+  const tag = currentComposerTag();
+  const found = tag ? gameById(tag) : null;
+  return `
+  <div class="chat-composer">
+    ${replyMsg ? `<div class="chat-replying">↩ replying to <strong>${esc(nameOf(replyMsg.author))}</strong>: ${esc(replyMsg.body.slice(0, 60))}
+      <button id="chat-cancel-reply">✕</button></div>` : ''}
+    ${found ? `<div class="chat-tag-chip-row"><span class="chat-tag-chip">🏈 ${esc(gameShort(found.game))}
+      <button id="chat-strip-tag" title="Remove game tag — post to the main room only">✕</button></span>
+      <span class="text-muted text-xs">tagged — shows in this game's thread and the room</span></div>` : ''}
+    <div class="chat-composer-row">
+      <textarea class="chat-input" id="chat-input" rows="1" maxlength="1000"
+        placeholder="Message the league…"></textarea>
+      <button class="chat-send-btn" id="chat-send">➤</button>
+    </div>
+    <div class="chat-composer-foot">
+      <div class="chat-emoji-row">${QUICK_EMOJI.map(e => `<button class="chat-emoji-insert" data-emoji="${e}">${e}</button>`).join('')}</div>
+      <span class="chat-char-count" id="chat-count" style="display:none"></span>
+    </div>
+    <div class="chat-mention-menu" id="chat-mention-menu" style="display:none"></div>
+  </div>`;
+}
+
+function currentComposerTag() {
+  // The cross-talk rule, made visible: reply inherits parent tag; else the view.
+  if (U.tagStripped) return '';
+  const viewTag = ['all', 'records', 'mentions'].includes(U.filter) ? '' : U.filter;
+  return resolveTag({ replyTo: U.replyTo, viewTag });
+}
+
+function mentionCandidates(prefix) {
+  const names = [...getPlayers().filter(p => p.active).map(p => ({ id: p.playerId, name: nameOf(p.playerId) })),
+                 { id: 'scribe', name: 'SCRIBE' }];
+  const low = prefix.toLowerCase();
+  return names.filter(n => n.name.toLowerCase().startsWith(low)).slice(0, 6);
+}
+
+function extractMentions(body) {
+  const ids = new Set();
+  const names = [...getPlayers().map(p => ({ id: p.playerId, name: nameOf(p.playerId) })), { id: 'scribe', name: 'scribe' }];
+  (body.match(/@([\w.']+)/g) || []).forEach(tok => {
+    const t = tok.slice(1).toLowerCase();
+    const hit = names.find(n => n.name.toLowerCase().startsWith(t));
+    if (hit) ids.add(hit.id);
   });
-  bindMessageActions(c, () => renderChatPage());
-  bindComposer(c, composerTarget, () => renderChatPage());
+  return [...ids];
 }
 
-function bindComposer(root, channel, rerender) {
-  const input = root.querySelector('#chat-input');
-  const send = root.querySelector('#chat-send-btn');
-  const count = root.querySelector('#chat-char-count');
-  if (!input) return;
-
-  input.addEventListener('input', () => {
-    const len = input.value.length;
-    if (count) count.textContent = len >= 900 ? `${len}/1000` : '';
-    input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-  });
-  const isDesktop = window.matchMedia('(min-width: 700px)').matches;
-  input.addEventListener('keydown', e => {
-    if (isDesktop && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
-  });
-  root.querySelectorAll('.chat-emoji-insert').forEach(b => b.addEventListener('click', () => {
-    input.value += b.dataset.e; input.focus(); input.dispatchEvent(new Event('input'));
-  }));
-  root.querySelector('#chat-cancel-reply')?.addEventListener('click', () => { _uiState.replyTo = null; rerender(); });
-  send?.addEventListener('click', doSend);
-
-  function doSend() {
-    const my = me(); if (!my) return;
-    const body = input.value.trim();
-    if (!body) return;
-    sendEvent({ type: 'message', channel, body, author: my, replyTo: _uiState.replyTo || '' });
-    _uiState.replyTo = null;
-    input.value = ''; input.dispatchEvent(new Event('input'));
-    // Deterministic-persona hooks (rate-limited inside)
-    try {
-      scribeInspectMessage({
-        author: my, authorName: nameOf(my), body, channel,
-        standings: currentStandingsContext(),
-      });
-    } catch {}
-    rerender();
-  }
-}
-
-function bindMessageActions(root, rerender) {
-  const my = me();
-  root.querySelectorAll('.chat-act').forEach(b => b.addEventListener('click', () => {
-    const { act, id, emoji } = b.dataset;
-    if (!my) return;
-    const m = getMessage(id); if (!m) return;
-    if (act === 'react') {
-      const has = (m.reactions[emoji] || []).includes(my);
-      sendEvent({ type: has ? 'unreact' : 'react', channel: m.channel, targetId: id, author: my, meta: { emoji } });
-      rerender();
-    } else if (act === 'reply') {
-      _uiState.replyTo = id; rerender();
-      setTimeout(() => root.querySelector('#chat-input')?.focus(), 50);
-    } else if (act === 'edit') {
-      const next = prompt('Edit message:', m.body);
-      if (next !== null && next.trim() && next !== m.body) {
-        sendEvent({ type: 'edit', channel: m.channel, targetId: id, body: next.trim(), author: my });
-        rerender();
-      }
-    } else if (act === 'delete') {
-      if (confirm('Withdraw this message? A tombstone will remain.')) {
-        sendEvent({ type: 'delete', channel: m.channel, targetId: id, author: my });
-        rerender();
-      }
-    }
-  }));
-  root.querySelectorAll('.chat-react-pill').forEach(b => b.addEventListener('click', () => {
-    if (!my) return;
-    const m = getMessage(b.dataset.id); if (!m) return;
-    const has = (m.reactions[b.dataset.emoji] || []).includes(my);
-    sendEvent({ type: has ? 'unreact' : 'react', channel: m.channel, targetId: b.dataset.id, author: my, meta: { emoji: b.dataset.emoji } });
-    rerender();
-  }));
-  root.querySelectorAll('.chat-retry').forEach(b => b.addEventListener('click', () => { retryFailed(b.dataset.id); rerender(); }));
-  root.querySelectorAll('.chat-game-chip').forEach(b => b.addEventListener('click', () => {
-    _uiState.channel = b.dataset.chan; renderChatPage();
-  }));
-  root.querySelectorAll('.chat-reply-quote').forEach(b => b.addEventListener('click', () => {
-    const el = root.querySelector(`.chat-msg[data-id="${b.dataset.target}"]`);
-    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    el?.classList.add('chat-flash'); setTimeout(() => el?.classList.remove('chat-flash'), 1200);
-  }));
-}
-
-function currentStandingsContext() {
+function doSend() {
+  const input = document.getElementById('chat-input');
+  const body = (input?.value || '').trim();
+  if (!body) return;
+  const self = me(); if (!self) return;
+  const gameTag = currentComposerTag();
+  const mentions = extractMentions(body);
+  sendMessage({ body, gameTag, replyTo: U.replyTo || '', author: self, mentions });
+  // SCRIBE participates as a member — it reads the room, it isn't summoned.
   try {
-    const players = getPlayers().filter(p => p.active !== false);
-    const standings = calculateSeasonStandings(players, getWeeklyResults());
-    if (!standings?.length) return null;
-    return {
-      firstPlaceName: players.find(p => p.playerId === standings[0].playerId)?.displayName || null,
-      lastPlaceId: standings[standings.length - 1].playerId,
-    };
+    scribeInspectMessage({ author: self, authorName: nameOf(self), body, gameTag, standings: standingsCtx() });
+  } catch {}
+  U.replyTo = null; U.tagStripped = false;
+  if (input) input.value = '';
+  renderChatPage();
+}
+
+function standingsCtx() {
+  try {
+    const players = getPlayers().filter(p => p.active);
+    // light context: derive first/last from stored season results if available
+    return null;   // full standings ctx wired in app layer when needed
   } catch { return null; }
 }
 
-// ── Game-card bottom sheet ────────────────────────────────────────────────────
+// ── Bindings ──────────────────────────────────────────────────────────────────
+function bindFilterButtons(root) {
+  root?.querySelectorAll('[data-chat-filter]').forEach(b => b.addEventListener('click', () => {
+    U.filter = b.dataset.chatFilter;
+    U.replyTo = null; U.tagStripped = false;
+    renderChatPage();
+  }));
+}
 
-export function openGameChatSheet(weekId, gameId) {
-  const g = getGames().find(x => x.gameId === gameId);
-  const channel = `game:${gameId}`;
-  closeGameChatSheet();
+function bindChatPage() {
+  const c = document.getElementById('page-chat'); if (!c) return;
+  bindFilterButtons(c);
+
+  document.getElementById('chat-prefs-btn')?.addEventListener('click', () => {
+    U.prefsOpen = !U.prefsOpen; renderChatPage();
+  });
+  bindPrefsPanel();
+
+  document.getElementById('chat-load-older')?.addEventListener('click', async e => {
+    e.target.textContent = '…';
+    await backfill(100);
+    renderChatPage();
+  });
+
+  const scroll = document.getElementById('chat-scroll');
+  const jump = document.getElementById('chat-jump');
+  scroll?.addEventListener('scroll', () => {
+    if (!jump) return;
+    const nearBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120;
+    jump.style.display = nearBottom ? 'none' : 'block';
+  });
+  jump?.addEventListener('click', () => { if (scroll) scroll.scrollTop = scroll.scrollHeight; });
+
+  c.querySelectorAll('[data-jump]').forEach(b => b.addEventListener('click', () => {
+    const el = c.querySelector(`[data-mid="${b.dataset.jump}"]`);
+    if (el) { el.scrollIntoView({ block: 'center' }); el.classList.add('chat-flash'); setTimeout(() => el.classList.remove('chat-flash'), 1200); }
+  }));
+
+  c.querySelectorAll('[data-react]').forEach(b => b.addEventListener('click', () => {
+    const self = me(); if (!self) return;
+    toggleReact(b.dataset.target, b.dataset.react, self);
+    renderChatPage();
+  }));
+  c.querySelectorAll('[data-reply]').forEach(b => b.addEventListener('click', () => {
+    U.replyTo = b.dataset.reply; U.tagStripped = false;
+    renderChatPage();
+    document.getElementById('chat-input')?.focus();
+  }));
+  c.querySelectorAll('[data-pin]').forEach(b => b.addEventListener('click', () => {
+    const self = me(); if (!self) return;
+    const msg = getMessage(b.dataset.pin);
+    pinMessage(b.dataset.pin, self, !msg?.pinned);
+    renderChatPage();
+  }));
+  c.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
+    const self = me(); if (!self) return;
+    const msg = getMessage(b.dataset.edit); if (!msg) return;
+    const next = prompt('Edit message (5-minute window):', msg.body);
+    if (next !== null && next.trim() && next !== msg.body) { editMessage(msg.id, next.trim(), self); renderChatPage(); }
+  }));
+  c.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => {
+    const self = me(); if (!self) return;
+    if (confirm('Withdraw this message? A tombstone will remain — SCRIBE keeps the receipts.')) {
+      deleteMessage(b.dataset.del, self); renderChatPage();
+    }
+  }));
+  c.querySelectorAll('[data-retry]').forEach(b => b.addEventListener('click', () => { retryFailed(b.dataset.retry); renderChatPage(); }));
+  c.querySelectorAll('[data-callout]').forEach(b => b.addEventListener('click', () => {
+    const self = me(); if (!self) return;
+    const msg = getMessage(b.dataset.callout); if (!msg) return;
+    sendEvent({
+      type: 'message', author: self, gameTag: msg.gameTag, notify: true,
+      body: 'Prior statement, for the record:',
+      meta: { mentions: [msg.author], quote: { id: msg.id, author: msg.author, body: msg.body.slice(0, 160) } },
+    });
+    renderChatPage();
+  }));
+
+  // composer
+  const input = document.getElementById('chat-input');
+  const count = document.getElementById('chat-count');
+  input?.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    const len = input.value.length;
+    if (count) { count.style.display = len >= 900 ? 'inline' : 'none'; count.textContent = `${len}/1000`; }
+    maybeMentionMenu(input);
+  });
+  input?.addEventListener('keydown', e => {
+    const desktop = matchMedia('(min-width: 700px)').matches;
+    if (e.key === 'Enter' && !e.shiftKey && desktop) { e.preventDefault(); doSend(); }
+  });
+  document.getElementById('chat-send')?.addEventListener('click', doSend);
+  document.getElementById('chat-cancel-reply')?.addEventListener('click', () => { U.replyTo = null; renderChatPage(); });
+  document.getElementById('chat-strip-tag')?.addEventListener('click', () => { U.tagStripped = true; renderChatPage(); });
+  c.querySelectorAll('.chat-emoji-insert').forEach(b => b.addEventListener('click', () => {
+    const inp = document.getElementById('chat-input');
+    if (inp) { inp.value += b.dataset.emoji; inp.focus(); }
+  }));
+}
+
+function maybeMentionMenu(input) {
+  const menu = document.getElementById('chat-mention-menu');
+  if (!menu) return;
+  const m = /@([\w.']*)$/.exec(input.value.slice(0, input.selectionStart ?? input.value.length));
+  if (!m) { menu.style.display = 'none'; return; }
+  const cands = mentionCandidates(m[1]);
+  if (!cands.length) { menu.style.display = 'none'; return; }
+  menu.innerHTML = cands.map(cd => `<button class="chat-mention-opt" data-mention="${esc(cd.name)}">@${esc(cd.name)}</button>`).join('');
+  menu.style.display = 'flex';
+  menu.querySelectorAll('[data-mention]').forEach(b => b.addEventListener('click', () => {
+    input.value = input.value.replace(/@[\w.']*$/, '@' + b.dataset.mention + ' ');
+    menu.style.display = 'none';
+    input.focus();
+  }));
+}
+
+// ── Prefs panel (identity + notifications) ────────────────────────────────────
+function prefsPanelHTML() {
+  const self = me();
+  if (!self) return '';
+  const prefs = getNotifPrefs();
+  const accent = getAccent();
+  return `
+  <div class="card mb-md chat-prefs">
+    <div class="chat-prefs-row"><label>Display name</label>
+      <input class="form-input" id="pref-nick" maxlength="16" value="${esc(getChatNick() || '')}" placeholder="${esc(getPlayer(self)?.displayName || '')}" /></div>
+    <div class="chat-prefs-row"><label>Accent</label>
+      <div class="chat-accent-row">${ACCENTS.map(a =>
+        `<button class="chat-accent-swatch${a === accent ? ' active' : ''}" data-accent="${a}" style="background:${a}"></button>`).join('')}
+        <button class="chat-accent-swatch chat-accent-none${!accent ? ' active' : ''}" data-accent="" title="Default">∅</button></div></div>
+    <div class="chat-prefs-row"><label>Toasts</label><input type="checkbox" id="pref-toasts" ${prefs.toasts ? 'checked' : ''}></div>
+    <div class="chat-prefs-row"><label>Sound</label><input type="checkbox" id="pref-sound" ${prefs.sound ? 'checked' : ''}></div>
+    <div class="chat-prefs-row"><label>League events</label><input type="checkbox" id="pref-sys" ${prefs.systemEvents ? 'checked' : ''}></div>
+  </div>`;
+}
+function bindPrefsPanel() {
+  document.getElementById('pref-nick')?.addEventListener('change', e => { setChatNick(e.target.value); renderChatPage(); });
+  document.querySelectorAll('[data-accent]').forEach(b => b.addEventListener('click', () => { setAccent(b.dataset.accent || null); renderChatPage(); }));
+  document.getElementById('pref-toasts')?.addEventListener('change', e => setNotifPrefs({ toasts: e.target.checked }));
+  document.getElementById('pref-sound')?.addEventListener('change', e => setNotifPrefs({ sound: e.target.checked }));
+  document.getElementById('pref-sys')?.addEventListener('change', e => { setNotifPrefs({ systemEvents: e.target.checked }); renderChatPage(); });
+}
+
+// ── Game-card bubble + bottom sheet ───────────────────────────────────────────
+export function gameChatBubbleHTML(gameId) {
+  const self = me();
+  const n = getMessages({ tag: gameId, types: ['message'] }).filter(m => !m.deleted).length;
+  const unread = self ? unreadCount(self, gameId) : 0;
+  return `<button class="chat-bubble-btn${unread ? ' has-unread' : ''}" data-chat-game="${esc(gameId)}" title="Game thread">
+    💬${n ? ` <span class="chat-bubble-count">${n}</span>` : ''}</button>`;
+}
+
+export function openGameChatSheet(gameId) {
+  U.sheetGameId = gameId;
+  document.getElementById('chat-sheet-wrap')?.remove();
+  const found = gameById(gameId);
   const wrap = document.createElement('div');
   wrap.id = 'chat-sheet-wrap';
+  const g = found?.game;
+  const score = g && g.homeScore != null ? `${g.awayScore}–${g.homeScore}` : '';
+  const firstUse = !localStorage.getItem('cfbp_chat_sheet_hint');
   wrap.innerHTML = `
-    <div class="chat-sheet-backdrop" id="chat-sheet-backdrop"></div>
+    <div class="chat-sheet-backdrop"></div>
     <div class="chat-sheet">
       <div class="chat-sheet-header">
-        <div>
-          <div class="chat-sheet-title">${g ? `${esc(g.awayTeam)} @ ${esc(g.homeTeam)}` : 'Game thread'}</div>
-          <div class="chat-sheet-sub">${g ? esc(formatSpread(g.lockedSpread ?? g.spread, g.favorite, g) || '') : ''} ${g?.status ? '· ' + esc(g.status.toUpperCase()) : ''}</div>
-        </div>
+        <div><div class="chat-sheet-title">${g ? esc(g.awayTeam) + ' @ ' + esc(g.homeTeam) : 'Game thread'}</div>
+          <div class="chat-sheet-sub">${g ? esc(formatSpread(g.lockedSpread ?? g.spread, g.favorite, g) || '') : ''}
+            ${g?.status === GAME_STATUS.LIVE ? ` · <span class="live-pulse"></span> LIVE ${score}` : score ? ' · ' + score : ''}</div></div>
         <div class="chat-sheet-header-actions">
-          <button class="btn btn-ghost btn-sm" id="chat-sheet-open-full">Open in chat</button>
+          <button class="btn btn-ghost btn-sm" id="chat-sheet-open-main">Open in chat</button>
           <button class="chat-sheet-close" id="chat-sheet-close">✕</button>
         </div>
       </div>
-      <div class="chat-scroll chat-sheet-scroll" id="chat-sheet-scroll">${renderMessageListHTML(channel)}</div>
-      <div id="chat-sheet-composer"></div>
+      ${firstUse ? '<div class="chat-sheet-hint" id="chat-sheet-hint">Posts here also appear in the main room, tagged to this game. <button id="chat-sheet-hint-ok">Got it</button></div>' : ''}
+      <div class="chat-scroll chat-sheet-scroll" id="chat-sheet-scroll"></div>
+      ${me() ? `<div class="chat-composer">
+        <div class="chat-composer-row">
+          <textarea class="chat-input" id="chat-sheet-input" rows="1" maxlength="1000" placeholder="Message this game's thread…"></textarea>
+          <button class="chat-send-btn" id="chat-sheet-send">➤</button>
+        </div></div>` : ''}
     </div>`;
   document.body.appendChild(wrap);
-  _uiState.sheetGameId = gameId;
-
-  const rerender = () => {
-    const sc = document.getElementById('chat-sheet-scroll');
-    if (sc) { sc.innerHTML = renderMessageListHTML(channel); bindMessageActions(sc, rerender); sc.scrollTop = sc.scrollHeight; }
-  };
-  renderSheetComposer(channel, rerender);
-  bindMessageActions(wrap, rerender);
-  document.getElementById('chat-sheet-close')?.addEventListener('click', closeGameChatSheet);
-  document.getElementById('chat-sheet-backdrop')?.addEventListener('click', closeGameChatSheet);
-  document.getElementById('chat-sheet-open-full')?.addEventListener('click', () => {
-    closeGameChatSheet();
-    _uiState.channel = channel;
-    window.navigateTo?.('chat');
+  renderSheetMessages();
+  wrap.querySelector('.chat-sheet-backdrop')?.addEventListener('click', closeSheet);
+  document.getElementById('chat-sheet-close')?.addEventListener('click', closeSheet);
+  document.getElementById('chat-sheet-hint-ok')?.addEventListener('click', () => {
+    localStorage.setItem('cfbp_chat_sheet_hint', '1');
+    document.getElementById('chat-sheet-hint')?.remove();
   });
-  const sc = document.getElementById('chat-sheet-scroll');
-  if (sc) sc.scrollTop = sc.scrollHeight;
-  const my = me();
-  if (my) setTimeout(() => { markSeen(my, channel); updateChatBadges(); }, 1000);
-  setPollMode('active');
+  document.getElementById('chat-sheet-open-main')?.addEventListener('click', () => { closeSheet(); U.filter = gameId; navToChat(); });
+  const send = () => {
+    const inp = document.getElementById('chat-sheet-input');
+    const body = (inp?.value || '').trim();
+    const self = me();
+    if (!body || !self) return;
+    sendMessage({ body, gameTag: gameId, author: self, mentions: extractMentions(body) });
+    try { scribeInspectMessage({ author: self, authorName: nameOf(self), body, gameTag: gameId }); } catch {}
+    if (inp) inp.value = '';
+    renderSheetMessages();
+  };
+  document.getElementById('chat-sheet-send')?.addEventListener('click', send);
+  document.getElementById('chat-sheet-input')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && matchMedia('(min-width:700px)').matches) { e.preventDefault(); send(); }
+  });
+  markSeen(gameId);
+  updateChatBadges();
+}
+function closeSheet() { U.sheetGameId = null; document.getElementById('chat-sheet-wrap')?.remove(); }
+function renderSheetMessages() {
+  const host = document.getElementById('chat-sheet-scroll');
+  if (!host || !U.sheetGameId) return;
+  const self = me();
+  const list = coalesceStream(getMessages({ tag: U.sheetGameId }));
+  host.innerHTML = list.length
+    ? list.map(item => item.kind === 'gamereact-run' ? gamereactRunHTML(item) : messageHTML(item, self, false)).join('')
+    : '<div class="chat-empty">No entries for this game yet.</div>';
+  host.scrollTop = host.scrollHeight;
+  host.querySelectorAll('[data-react]').forEach(b => b.addEventListener('click', () => {
+    if (!self) return; toggleReact(b.dataset.target, b.dataset.react, self); renderSheetMessages();
+  }));
+  host.querySelectorAll('[data-retry]').forEach(b => b.addEventListener('click', () => { retryFailed(b.dataset.retry); renderSheetMessages(); }));
 }
 
-function renderSheetComposer(channel, rerender) {
-  const host = document.getElementById('chat-sheet-composer'); if (!host) return;
-  const my = me();
-  host.innerHTML = my ? `
-    <div class="chat-composer chat-composer-sheet">
-      <div class="chat-composer-row">
-        <textarea id="chat-input" class="chat-input" rows="1" maxlength="1000" placeholder="Talk your talk…"></textarea>
-        <button class="chat-send-btn" id="chat-send-btn">➤</button>
-      </div>
-      <div class="chat-composer-foot">
-        <span class="chat-emoji-row">${QUICK_EMOJI.map(e => `<button class="chat-emoji-insert" data-e="${e}">${e}</button>`).join('')}</span>
-        <span class="chat-char-count" id="chat-char-count"></span>
-      </div>
-    </div>` : '<div class="chat-login-note">🔒 Log in on the Picks tab to post.</div>';
-  bindComposer(host, channel, rerender);
-}
-
-export function closeGameChatSheet() {
-  document.getElementById('chat-sheet-wrap')?.remove();
-  _uiState.sheetGameId = null;
-  setPollMode('passive');
-}
-
-/** Comment-bubble HTML for a game card (count = non-deleted messages in thread). */
-export function gameChatBubbleHTML(gameId) {
-  const n = getChannelMessages(`game:${gameId}`).filter(m => !m.deleted && m.type === 'message').length;
-  const my = me();
-  const unread = my ? unreadCount(my, `game:${gameId}`) : 0;
-  return `<button class="chat-bubble-btn ${unread ? 'has-unread' : ''}" data-chat-game="${esc(gameId)}" title="Game thread">
-    💬${n ? `<span class="chat-bubble-count">${n}</span>` : ''}</button>`;
-}
-
-// ── Nav badge + dashboard teaser ──────────────────────────────────────────────
-
-export function updateChatBadges() {
-  const my = me();
-  const total = my ? unreadCount(my) : 0;
-  const nav = document.querySelector('.nav-item[data-tab="chat"]');
-  if (nav) {
-    let dot = nav.querySelector('.nav-unread');
-    if (total > 0) {
-      if (!dot) { dot = document.createElement('span'); dot.className = 'nav-unread'; nav.appendChild(dot); }
-      dot.textContent = total > 99 ? '99+' : String(total);
-    } else dot?.remove();
-  }
-  const teaser = document.getElementById('dash-chat-teaser');
-  if (teaser) teaser.outerHTML = dashboardChatTeaserHTML();
-}
-
+// ── Dashboard sticky bar ──────────────────────────────────────────────────────
 export function dashboardChatTeaserHTML() {
-  const my = me();
-  const total = my ? unreadCount(my) : 0;
-  const latest = getChannelMessages('all').filter(m => !m.deleted && m.type === 'message').slice(-1)[0];
-  const preview = latest ? `<strong>${esc(nameOf(latest.author))}:</strong> ${esc(latest.body.slice(0, 70))}` : 'No messages yet — start the season chirping.';
+  const self = me();
+  const n = self ? unreadCount(self, 'all') : 0;
+  const latest = latestNotifying(self);
+  const preview = latest ? `<strong>${esc(nameOf(latest.author))}</strong>: ${esc(latest.body.slice(0, 64))}` : 'The room is open.';
   return `
-    <div class="card mb-md dash-chat-teaser" id="dash-chat-teaser">
-      <div class="dash-chat-left">
-        <span class="dash-chat-icon">💬</span>
-        <div><div class="dash-chat-title">League Chat ${total ? `<span class="chat-unread-dot">${total}</span>` : ''}</div>
-        <div class="dash-chat-preview">${preview}</div></div>
+  <div class="card mb-md dash-chat-teaser" id="dash-chat-teaser">
+    <div class="dash-chat-left" data-open-chat>
+      <span class="dash-chat-icon">💬</span>
+      <div>
+        <div class="dash-chat-title">League Chat ${n ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : ''}</div>
+        <div class="dash-chat-preview">${preview}</div>
       </div>
-      <button class="btn btn-primary btn-sm" data-open-chat>Open</button>
-    </div>`;
+    </div>
+    ${self ? `<div class="dash-chat-quick">
+      <input class="form-input dash-chat-input" id="dash-quick-input" maxlength="1000" placeholder="Quick reply…" />
+      <button class="btn btn-primary btn-sm" id="dash-quick-send">➤</button>
+    </div>` : ''}
+  </div>`;
 }
 
-// ── System events (deterministic ids ⇒ exactly-once across 6 clients) ─────────
-// HARD RULE — NO PRE-LOCK PICK LEAKAGE: lock announcements are COUNT ONLY.
-// Nothing here may reveal a selection before that game's lock time.
+function bindDashboardTeaser() {
+  const send = () => {
+    const inp = document.getElementById('dash-quick-input');
+    const body = (inp?.value || '').trim();
+    const self = me();
+    if (!body || !self) return;
+    sendMessage({ body, gameTag: '', author: self, mentions: extractMentions(body) });
+    if (inp) { inp.value = ''; inp.placeholder = 'Sent ✓'; setTimeout(() => { inp.placeholder = 'Quick reply…'; }, 1500); }
+    updateChatBadges();
+  };
+  document.getElementById('dash-quick-send')?.addEventListener('click', e => { e.stopPropagation(); send(); });
+  document.getElementById('dash-quick-input')?.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+  document.getElementById('dash-quick-input')?.addEventListener('click', e => e.stopPropagation());
+}
+
+// ── Legacy alias (app.js compatibility) ───────────────────────────────────────
+export function setChatChannel(ch) {
+  if (!ch || ch === 'general' || ch === 'all') U.filter = 'all';
+  else if (ch.startsWith('game:')) U.filter = ch.slice(5);
+  else U.filter = ch;
+}
+
+// ── System event emitters (deterministic ids — AD-11) ─────────────────────────
+// HARD RULE: nothing may reveal a player's selections before that week locks.
 
 export function emitPicksLockedEvent(weekId, playerId, count, total) {
   sendEvent({
-    type: 'system', channel: 'general', author: 'system',
-    id: `sys_lock_${weekId}_${playerId}`,
-    body: `${nameOf(playerId)} locked ${count}/${total} picks`,   // counts only — never selections
-    meta: { kind: 'picksLocked' },
+    id: `sys_lock_${weekId}_${playerId}`, type: 'system', author: 'system', notify: false,
+    body: `${nameOf(playerId)} locked ${count}/${total}`,
+    meta: { kind: 'picksLocked', weekId, playerId },
   });
 }
 
-export function emitGameFinalEvent(game, atsWinner, winners, losers) {
-  if (!game || !atsWinner) return;
-  const w = winners.map(nameOf).join(', ') || 'nobody';
-  const l = losers.map(nameOf).join(', ') || 'nobody';
-  const body = atsWinner === 'no_decision'
-    ? `FINAL: ${game.awayTeam} @ ${game.homeTeam} — pushed. No decision.`
-    : `FINAL: ${game.awayTeam} @ ${game.homeTeam} — ${atsWinner} covers. ✅ ${w} · ❌ ${l}`;
-  sendEvent({
-    type: 'system', channel: `game:${game.gameId}`, author: 'system',
-    id: `sys_final_${game.gameId}`, body, meta: { kind: 'gameFinal' },
+/** THE PICK REVEAL RITUAL — at lock, one system event posts everyone's full
+ *  picks simultaneously. The one guaranteed weekly all-hands moment. */
+export function emitPickRevealEvent(week) {
+  if (!week) return;
+  const eff = getEffectiveWeekStatus(week);
+  if (!['locked', 'live', 'final'].includes(eff) && week.status !== 'final') return;   // never pre-lock
+  const games = getGames(week.weekId).sort((a, b) => new Date(a.kickoff) - new Date(b.kickoff));
+  if (!games.length) return;
+  const players = getPlayers().filter(p => p.active);
+  const lines = players.map(p => {
+    const picks = getPicks(week.weekId, p.playerId);
+    if (!picks.length) return `${nameOf(p.playerId)} — no orders on file`;
+    const parts = games.map(g => {
+      const pk = picks.find(x => x.gameId === g.gameId);
+      return pk ? pk.selectedTeam.split(' ').pop() : '—';
+    });
+    return `${nameOf(p.playerId)}: ${parts.join(' · ')}`;
   });
+  sendEvent({
+    id: `sys_reveal_${week.weekId}`, type: 'system', author: 'system', notify: true,
+    body: lines.join('\n'),
+    meta: { kind: 'reveal', weekId: week.weekId, title: `${formatWeekLabel(week)} — the orders are in` },
+  });
+  showToast({ author: 'system', body: `🔓 ${formatWeekLabel(week)} picks revealed` }, { force: true });
+}
+
+export function emitKickoffEvent(game) {
+  sendEvent({
+    id: `sys_kick_${game.gameId}`, type: 'system', author: 'system', notify: false,
+    gameTag: game.gameId,
+    body: `🏈 Kickoff — ${game.awayTeam} @ ${game.homeTeam} ${formatSpread(game.lockedSpread ?? game.spread, game.favorite, game) || ''}`,
+    meta: { kind: 'kickoff', gameId: game.gameId },
+  });
+}
+
+export function emitGameFinalEvent(game, atsWinner, winnerIds = [], loserIds = []) {
+  const cover = atsWinner === 'no_decision' ? 'Push — no decision'
+    : `${atsWinner} covers ✅`;
+  const who = atsWinner === 'no_decision' ? ''
+    : ` — right: ${winnerIds.length ? winnerIds.map(nameOf).join(', ') : 'nobody'}; wrong: ${loserIds.length ? loserIds.map(nameOf).join(', ') : 'nobody'}`;
+  sendEvent({
+    id: `sys_final_${game.gameId}`, type: 'system', author: 'system', notify: false,
+    gameTag: game.gameId,
+    body: `FINAL: ${game.awayTeam} ${game.awayScore}–${game.homeScore} ${game.homeTeam}. ${cover}${who}`,
+    meta: { kind: 'gameFinal', gameId: game.gameId },
+  });
+  // SCRIBE's unprompted callout: one pre-kick statement from a player who lost
+  // this game ATS, quoted next to the result. Rate limits apply.
+  try {
+    const kicked = game.kickoff ? new Date(game.kickoff).getTime() : 0;
+    const candidates = getMessages({ tag: game.gameId, types: ['message'] })
+      .filter(m => !m.deleted && loserIds.includes(m.author) && kicked && (m.ts || 0) < kicked);
+    if (candidates.length) {
+      const pick = candidates.sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0))[0];
+      scribeTrigger('callout', {
+        gameTag: game.gameId, subject: game.gameId,
+        quote: { id: pick.id, author: pick.author, body: pick.body.slice(0, 160) },
+      });
+    }
+  } catch {}
 }
 
 export function emitExtraPointEvent(weekId, graded) {
-  if (!graded) return;
-  const winners = graded.rows.filter(r => ['blackjack', 'win', 'push-win'].includes(r.outcome));
-  const busts = graded.rows.filter(r => r.outcome === 'bust');
-  const body = graded.allBusted
-    ? `Extra Point (longest FG ${graded.actual} yd): the entire table busted.`
-    : `Extra Point (longest FG ${graded.actual} yd): ${winners.map(w => w.displayName).join(' & ')} ${winners[0]?.outcome === 'blackjack' ? 'hit BLACKJACK' : 'win'}${busts.length ? ` · busted: ${busts.map(b => b.displayName).join(', ')}` : ''}`;
-  sendEvent({
-    type: 'system', channel: 'general', author: 'system',
-    id: `sys_ep_${weekId}`, body, meta: { kind: 'extraPoint' },
+  const lines = graded.rows.map(r => {
+    const label = { blackjack: '🂡 BLACKJACK', win: '✅ win', 'push-win': '✅ shared win', bust: '💥 bust', alive: 'under', 'no-entry': '—' }[r.outcome] || r.outcome;
+    return `${r.displayName}: ${r.guess == null ? 'no entry' : r.guess + ' yd'} ${label}`;
   });
-  // SCRIBE follows with commentary (rate-limited internally)
-  if (busts.length) scribeTrigger('extraPointBust', { channel: 'general', subject: weekId, vars: { name: busts[0].displayName } });
-  else if (winners.length) scribeTrigger('extraPointWin', { channel: 'general', subject: weekId, vars: { name: winners[0].displayName } });
+  sendEvent({
+    id: `sys_ep_${weekId}`, type: 'system', author: 'system', notify: false,
+    body: `🎯 Extra Point — actual ${graded.actual} yd\n${lines.join('\n')}${graded.allBusted ? '\nEveryone over. The house (the chart) wins.' : ''}`,
+    meta: { kind: 'extraPoint', weekId },
+  });
+  try {
+    const bust = graded.rows.find(r => r.outcome === 'bust');
+    const win = graded.rows.find(r => r.outcome === 'blackjack' || r.outcome === 'win' || r.outcome === 'push-win');
+    if (graded.allBusted) scribeTrigger('extraPointBust', { subject: weekId, vars: { name: 'the entire cohort' } });
+    else if (win) scribeTrigger('extraPointWin', { subject: weekId, vars: { name: win.displayName } });
+    else if (bust) scribeTrigger('extraPointBust', { subject: weekId, vars: { name: bust.displayName } });
+  } catch {}
 }
 
-export function emitWeekFinalEvent(week, resultsRanked) {
-  if (!week || !resultsRanked?.length) return;
-  const top = resultsRanked[0];
+export function emitWeekFinalEvent(week, rankedResults) {
+  if (!rankedResults?.length) return;
+  const lines = rankedResults.map(r => `${r.rank}. ${nameOf(r.playerId)} — ${r.correctPicks}`);
   sendEvent({
-    type: 'system', channel: `week:${week.weekId}`, author: 'system',
-    id: `sys_weekfinal_${week.weekId}`,
-    body: `${formatWeekLabel(week)} is FINAL. Week winner: ${nameOf(top.playerId)}.`,
-    meta: { kind: 'weekFinal' },
+    id: `sys_weekfinal_${week.weekId}`, type: 'system', author: 'system', notify: false,
+    body: `📊 ${formatWeekLabel(week)} final\n${lines.join('\n')}`,
+    meta: { kind: 'weekFinal', weekId: week.weekId },
   });
+  // Hall of Records auto-promotion: the week's top-reacted message becomes canon.
+  try {
+    const start = week.startDate ? new Date(week.startDate + 'T00:00:00').getTime() - 4 * 86400000 : 0;
+    const end = Date.now();
+    const top = getMessages({ tag: 'all', types: ['message'] })
+      .filter(m => !m.deleted && m.author !== 'system' && (m.ts || 0) >= start && (m.ts || 0) <= end)
+      .map(m => ({ m, n: Object.values(m.reactions || {}).reduce((a, v) => a + v.length, 0) }))
+      .sort((a, b) => b.n - a.n)[0];
+    if (top && top.n >= 2 && !top.m.pinned) {
+      sendEvent({ id: `pin_wk_${week.weekId}`, type: 'pin', targetId: top.m.id, author: 'scribe', notify: false });
+    }
+  } catch {}
 }
 
-// ── Boot glue ─────────────────────────────────────────────────────────────────
+// ── SCRIBE live-game observation (rides the existing score poll) ──────────────
+/** Called per game on each score refresh with the pre-update copy. */
+export function scribeLiveGameCheck(prevGame, nextGame) {
+  try {
+    if (!nextGame || nextGame.status !== GAME_STATUS.LIVE) return;
+    const found = gameById(nextGame.gameId);
+    const week = found?.week || getCurrentWeek();
+    const nPicks = week ? getPicks(week.weekId).filter(p => p.gameId === nextGame.gameId).length : 0;
+    if (nPicks < 3) return;   // only hotly-contested, widely-picked games
+    const spread = nextGame.lockedSpread ?? nextGame.spread;
+    if (spread == null || nextGame.homeScore == null || prevGame?.homeScore == null) return;
+    const margin = g => (g.homeScore + spread) - g.awayScore;   // >0 home covering
+    const before = margin(prevGame), after = margin(nextGame);
+    if (Math.sign(before) !== Math.sign(after) && before !== 0 && after !== 0) {
+      scribeTrigger('coverageFlip', { gameTag: nextGame.gameId, subject: nextGame.gameId, bucketMin: 30 });
+      return;
+    }
+    // Upset watch: the underdog leading outright by 9+
+    const homeIsFav = nextGame.favorite === nextGame.homeTeam;
+    const dogLead = homeIsFav ? nextGame.awayScore - nextGame.homeScore : nextGame.homeScore - nextGame.awayScore;
+    if (dogLead >= 9) {
+      const dog = homeIsFav ? nextGame.awayTeam : nextGame.homeTeam;
+      scribeTrigger('upsetWatch', { gameTag: nextGame.gameId, subject: nextGame.gameId, bucketMin: 60, vars: { TEAM: dog } });
+    }
+  } catch {}
+}
 
+// ── "One year ago today" (dormant until CFP 2K27 — data exists from day one) ──
+function maybeAnniversary() {
+  try {
+    const key = 'cfbp_scribe_anniv';
+    const today = new Date().toISOString().slice(0, 10);
+    if (localStorage.getItem(key) === today) return;
+    const target = Date.now() - 365 * 86400000;
+    const hit = getMessages({ tag: 'all', types: ['message'] })
+      .filter(m => !m.deleted && m.author !== 'system' && Math.abs((m.ts || 0) - target) < 12 * 3600000)
+      .sort((a, b) => Object.values(b.reactions || {}).flat().length - Object.values(a.reactions || {}).flat().length)[0];
+    localStorage.setItem(key, today);
+    if (hit) scribeTrigger('anniversary', {
+      subject: hit.id, quote: { id: hit.id, author: hit.author, body: hit.body.slice(0, 160) },
+    });
+  } catch {}
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
 export function initChatUI() {
-  initChat();
-  onChat((kind) => {
-    // Live-update whichever chat surface is on screen.
-    if (kind === 'events' || kind === 'sent' || kind === 'online' || kind === 'offline') {
-      if (document.getElementById('page-chat')?.classList.contains('active')) renderChatPage();
-      if (_uiState.sheetGameId) {
-        const sc = document.getElementById('chat-sheet-scroll');
-        if (sc) {
-          const channel = `game:${_uiState.sheetGameId}`;
-          const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 60;
-          sc.innerHTML = renderMessageListHTML(channel);
-          bindMessageActions(sc, () => {});
-          if (atBottom) sc.scrollTop = sc.scrollHeight;
-        }
-      }
+  initChat(me());
+
+  onChat((kind, detail) => {
+    if (kind === 'events') {
       updateChatBadges();
+      const self = me();
+      const latest = latestNotifying(self);
+      if (latest && latest.author !== self && !latest.local &&
+          typeof latest.seq === 'number' && latest.seq > getLastSeen().seq) {
+        if (!chatPageActive()) { showToast(latest); playBlip(); }
+      }
+      if (chatPageActive()) renderChatPage();
+      if (U.sheetGameId) renderSheetMessages();
+      const teaser = document.getElementById('dash-chat-teaser');
+      if (teaser && !document.getElementById('dash-quick-input')?.matches(':focus')) {
+        teaser.outerHTML = dashboardChatTeaserHTML();
+        bindDashboardTeaser();
+      }
+    }
+    if (kind === 'offline' || kind === 'online' || kind === 'presence') {
+      if (chatPageActive()) renderChatPage();
     }
   });
-  // Delegated: dashboard teaser + game-card bubbles work wherever they render.
-  document.addEventListener('click', (e) => {
-    const openBtn = e.target.closest?.('[data-open-chat]');
-    if (openBtn) { _uiState.channel = 'all'; window.navigateTo?.('chat'); return; }
-    const bubble = e.target.closest?.('[data-chat-game]');
-    if (bubble) {
-      const week = getCurrentWeek();
-      openGameChatSheet(week?.weekId, bubble.dataset.chatGame);
+
+  // Delegated clicks that survive any re-render
+  document.addEventListener('click', e => {
+    const gameBtn = e.target.closest?.('[data-chat-game]');
+    if (gameBtn) { e.preventDefault(); openGameChatSheet(gameBtn.dataset.chatGame); return; }
+    const openChat = e.target.closest?.('[data-open-chat]');
+    if (openChat) { e.preventDefault(); navToChat(); }
+  });
+
+  // Rebind the teaser whenever the dashboard renders it
+  const rebind = new MutationObserver(() => {
+    if (document.getElementById('dash-quick-input') && !document.getElementById('dash-quick-input')._bound) {
+      document.getElementById('dash-quick-input')._bound = true;
+      bindDashboardTeaser();
     }
   });
+  try { rebind.observe(document.body, { childList: true, subtree: true }); } catch {}
+
+  maybeAnniversary();
+  updateChatBadges();
 }
-
-export function chatChannelForNav() { return _uiState.channel; }
-export function setChatChannel(ch) { _uiState.channel = ch; }
-
-// Digest passthrough for the admin panel.
-export { chatDigest };

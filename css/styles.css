@@ -1261,7 +1261,7 @@ label[for="week-show-history"],label:has(#week-show-history){
 
 /* messages */
 .chat-msg{display:flex;gap:8px;margin-bottom:10px}
-.chat-msg.is-pending{opacity:.6}
+.chat-msg.is-pending{opacity:1} /* v0.17.0 — pending shows a 🕐, never dimmed text (stuck-dim was the offline bug's symptom) */
 .chat-msg.is-failed .chat-bubble{border:1px solid #B02A37}
 .chat-flash .chat-bubble{outline:2px solid var(--maroon);transition:outline .2s}
 .chat-avatar{flex:0 0 30px;width:30px;height:30px;border-radius:50%;background:var(--maroon-tint);color:var(--maroon);display:flex;align-items:center;justify-content:center;font-size:.68rem;font-weight:700;margin-top:2px}
@@ -1332,3 +1332,77 @@ label[for="week-show-history"],label:has(#week-show-history){
 .dash-chat-icon{font-size:1.3rem}
 .dash-chat-title{font-family:'Oswald',sans-serif;font-weight:600;color:var(--maroon);display:flex;gap:6px;align-items:center}
 .dash-chat-preview{font-size:.75rem;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:56vw}
+
+
+/* ═══ v0.17.0 — one-room chat, notifications, identity ═══ */
+.chat-header-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.chat-pending{font-size:.7rem}
+.chat-view-header{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  padding:8px 12px;margin-bottom:8px;background:var(--bg-card);border:1px solid var(--border);
+  border-radius:10px;font-size:.82rem}
+.live-pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:#DC2626;
+  margin-right:4px;animation:livePulse 1.4s ease-in-out infinite}
+@keyframes livePulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.75)}}
+.chat-pill-live{border-color:#DC2626 !important}
+.chat-day-sep{text-align:center;font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--text-muted);margin:14px 0 8px}
+.chat-new-divider{display:flex;align-items:center;gap:8px;margin:10px 0;color:#B02A37;font-size:.66rem;
+  letter-spacing:.12em;font-weight:700}
+.chat-new-divider::before,.chat-new-divider::after{content:'';flex:1;height:1px;background:#B02A37;opacity:.5}
+.chat-jump-latest{position:sticky;bottom:76px;margin-left:auto;display:block;
+  background:var(--maroon);color:#fff;border:none;border-radius:999px;padding:6px 14px;
+  font-size:.75rem;cursor:pointer;box-shadow:var(--shadow-btn)}
+.chat-flash{animation:chatFlash 1.2s ease-out}
+@keyframes chatFlash{0%{background:var(--gold-pale)}100%{background:transparent}}
+.chat-load-older{display:block;margin:0 auto 10px;background:none;border:1px solid var(--border);
+  border-radius:999px;padding:4px 12px;font-size:.7rem;color:var(--text-muted);cursor:pointer}
+.chat-tag-chip-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.chat-tag-chip{display:inline-flex;align-items:center;gap:6px;background:var(--maroon-pale);
+  border:1px solid var(--maroon-tint);color:var(--maroon);border-radius:999px;
+  padding:3px 10px;font-size:.72rem;font-weight:600}
+.chat-tag-chip button{background:none;border:none;cursor:pointer;color:inherit;font-size:.75rem;padding:0}
+.chat-game-chip{background:var(--bg-card-alt);border:1px solid var(--border);border-radius:999px;
+  padding:1px 8px;font-size:.64rem;color:var(--text-secondary);cursor:pointer}
+.pick-chip{display:inline-flex;align-items:center;gap:2px;font-size:.62rem;font-weight:700;
+  padding:1px 6px;border-radius:999px;background:var(--gold-pale);border:1px solid var(--gold);color:#6b5900}
+.pick-chip-win{background:#E7F6EC;border-color:#1E7E34;color:#1E7E34}
+.pick-chip-loss{background:#FBEAEA;border-color:#B02A37;color:#B02A37}
+.chat-pinned{font-size:.68rem}
+.chat-seen{font-size:.62rem;color:var(--text-muted);margin-top:2px;text-align:right}
+.chat-quote-static{opacity:.85}
+.chat-gamereact .chat-system-body{font-style:italic}
+.chat-reveal{background:var(--gold-pale);border:1px solid var(--gold);border-radius:12px;padding:10px}
+.chat-reveal-title{font-family:'Oswald',sans-serif;font-weight:700;letter-spacing:.04em;margin-bottom:6px}
+.chat-reveal .chat-system-body{white-space:pre-line;font-variant-numeric:tabular-nums}
+.chat-mention-menu{display:flex;gap:6px;flex-wrap:wrap;padding:6px 0}
+.chat-mention-opt{background:var(--bg-card-alt);border:1px solid var(--border);border-radius:999px;
+  padding:3px 10px;font-size:.72rem;cursor:pointer}
+.chat-mention-opt:hover{border-color:var(--maroon);color:var(--maroon)}
+/* Toast */
+.chat-toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:1200;
+  display:flex;align-items:center;gap:10px;max-width:min(92vw,420px);
+  background:var(--bg-card);border:1px solid var(--border-strong);border-radius:12px;
+  padding:10px 14px;box-shadow:var(--shadow-card);cursor:pointer;animation:toastIn .25s ease-out}
+@keyframes toastIn{from{opacity:0;transform:translate(-50%,-8px)}to{opacity:1;transform:translate(-50%,0)}}
+.chat-toast-avatar{width:28px;height:28px;border-radius:50%;background:var(--maroon-pale);color:var(--maroon);
+  display:inline-flex;align-items:center;justify-content:center;font-size:.7rem;font-weight:700;flex-shrink:0}
+.chat-toast-body{font-size:.78rem;line-height:1.3;overflow:hidden}
+/* Prefs */
+.chat-prefs .chat-prefs-row{display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border)}
+.chat-prefs .chat-prefs-row:last-child{border-bottom:none}
+.chat-prefs label{font-size:.74rem;font-weight:600;min-width:100px}
+.chat-accent-row{display:flex;gap:6px;flex-wrap:wrap}
+.chat-accent-swatch{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer}
+.chat-accent-swatch.active{border-color:var(--text);transform:scale(1.12)}
+.chat-accent-none{background:var(--bg-card-alt);color:var(--text-muted);font-size:.7rem}
+/* Dashboard quick-reply */
+.dash-chat-teaser{display:flex;flex-direction:column;gap:8px}
+.dash-chat-left{display:flex;align-items:center;gap:10px;cursor:pointer}
+.dash-chat-quick{display:flex;gap:6px}
+.dash-chat-input{flex:1;font-size:.8rem}
+/* Sheet extras */
+.chat-sheet-header-actions{display:flex;align-items:center;gap:6px}
+.chat-sheet-hint{background:var(--gold-pale);border:1px solid var(--gold);border-radius:8px;
+  padding:6px 10px;margin:8px 12px 0;font-size:.72rem;display:flex;justify-content:space-between;gap:8px;align-items:center}
+.chat-sheet-hint button{background:none;border:none;color:var(--maroon);font-weight:700;cursor:pointer;font-size:.72rem}
+.recap-alias{color:var(--text-muted);font-size:.72em;font-style:italic}
