@@ -65,6 +65,7 @@ function setup() {
     snap.setFrozenRows(1);
   }
   ensureMsgSheet();
+  ensureMetricsSheet();
   // Generate a token if none exists
   var props = PropertiesService.getScriptProperties();
   if (!props.getProperty(TOKEN_PROP)) {
@@ -103,7 +104,7 @@ function handle(req, isGet) {
   var action = req.action || 'ping';
 
   if (action === 'ping') {
-    return json({ ok: true, time: new Date().toISOString(), service: 'cfbp-backend', version: 1 });
+    return json({ ok: true, time: new Date().toISOString(), service: 'cfbp-backend', version: 2 });
   }
 
   var token = PropertiesService.getScriptProperties().getProperty(TOKEN_PROP);
@@ -115,17 +116,20 @@ function handle(req, isGet) {
 
   try {
     switch (action) {
-      case 'getAll':          return json({ ok: true, data: getAll() });
+      case 'getAll':          return json({ ok: true, data: getAll(), chatHead: msgHeadCached() });
       case 'get':             return json({ ok: true, key: req.key, value: getOne(req.key) });
       case 'set':             setOne(req.key, req.value); return json({ ok: true });
       case 'setMany':         return json({ ok: true, count: setMany(req.entries || {}) });
       case 'snapshot':        return json({ ok: true, id: makeSnapshot(req.label || '') });
       case 'listSnapshots':   return json({ ok: true, snapshots: listSnapshots() });
       case 'restoreSnapshot': restoreSnapshot(req.id); return json({ ok: true });
-      // ── Chat (v0.16.0) — append-only event log ──
+      // ── Chat (v0.17.0) — append-only event log, one room + gameTag ──
+      case 'chatHead':        return json({ ok: true, head: msgHeadCached() });
       case 'chatAppend':      return json(chatAppend(req.events || []));
       case 'chatSince':       return json(chatSince(Number(req.seq || 0), Number(req.limit || 500)));
       case 'chatBefore':      return json(chatBefore(Number(req.seq || 0), Number(req.limit || 100)));
+      case 'presence':        return json(presenceBeat(String(req.player || ''), Number(req.seen || 0)));
+      case 'chatMetrics':     return json({ ok: true, rows: readMetrics(Number(req.days || 7)) });
       default:                return json({ ok: false, error: 'Unknown action: ' + action });
     }
   } catch (err) {
@@ -269,6 +273,108 @@ function msgHead(s) {
   return Math.max(0, s.getLastRow() - 1);
 }
 
+// v0.17.0 — HOT PATH. Six clients poll the head constantly; serve it from
+// CacheService (5s TTL) so a cache hit never touches the sheet. Invalidated
+// (overwritten) on every successful append.
+function msgHeadCached() {
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get('chatHead');
+  if (hit !== null) { bump('headHit'); return Number(hit); }
+  bump('headMiss');
+  var head = msgHead(ensureMsgSheet());
+  cache.put('chatHead', String(head), 5);
+  return head;
+}
+
+// ── Presence (v0.17.0) — CacheService only, ZERO sheet writes ──
+// Each beat stores {ts, seen} under a per-player key (120s TTL). The response
+// lists everyone seen in the last 90s, and each player's lastSeenSeq — which is
+// what makes read receipts possible without any new storage.
+function presenceBeat(playerId, seenSeq) {
+  var cache = CacheService.getScriptCache();
+  var now = Date.now();
+  if (playerId) {
+    cache.put('pr_' + playerId, JSON.stringify({ ts: now, seen: seenSeq || 0 }), 120);
+    var roster = {};
+    try { roster = JSON.parse(cache.get('pr_roster') || '{}'); } catch (e) { roster = {}; }
+    roster[playerId] = now;
+    cache.put('pr_roster', JSON.stringify(roster), 3600);
+  }
+  var out = [];
+  var roster2 = {};
+  try { roster2 = JSON.parse(cache.get('pr_roster') || '{}'); } catch (e) { roster2 = {}; }
+  for (var pid in roster2) {
+    var raw = cache.get('pr_' + pid);
+    if (!raw) continue;
+    try {
+      var rec = JSON.parse(raw);
+      if (now - rec.ts <= 90000) out.push({ playerId: pid, ts: rec.ts, seen: rec.seen || 0 });
+    } catch (e) {}
+  }
+  return { ok: true, present: out };
+}
+
+// ── ChatMetrics (v0.17.0) — cheap counters in CacheService, flushed to the
+// ChatMetrics sheet on appends (already inside the lock) so poll reads stay
+// write-free. Approximate by design; it exists to make the migration triggers
+// in the spec measurable.
+var METRICS_SHEET = 'CFBP_CHAT_METRICS';
+var METRIC_FIELDS = ['execCount','appendCount','sinceCount','headHit','headMiss'];
+
+function bump(field) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var key = 'cm_' + todayStr() + '_' + field;
+    cache.put(key, String(Number(cache.get(key) || 0) + 1), 21600);
+  } catch (e) {}
+}
+
+function todayStr() {
+  return Utilities.formatDate(new Date(), 'America/Chicago', 'yyyy-MM-dd');
+}
+
+function ensureMetricsSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var s = ss.getSheetByName(METRICS_SHEET);
+  if (!s) {
+    s = ss.insertSheet(METRICS_SHEET);
+    s.getRange(1, 1, 1, METRIC_FIELDS.length + 1).setValues([['date'].concat(METRIC_FIELDS)]);
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+function flushMetrics() {
+  try {
+    var cache = CacheService.getScriptCache();
+    var day = todayStr();
+    var row = [day];
+    for (var i = 0; i < METRIC_FIELDS.length; i++) row.push(Number(cache.get('cm_' + day + '_' + METRIC_FIELDS[i]) || 0));
+    var s = ensureMetricsSheet();
+    var last = s.getLastRow();
+    if (last >= 2 && String(s.getRange(last, 1).getValue()) === day) {
+      s.getRange(last, 1, 1, row.length).setValues([row]);
+    } else {
+      s.appendRow(row);
+    }
+  } catch (e) {}
+}
+
+function readMetrics(days) {
+  var s = ensureMetricsSheet();
+  var last = s.getLastRow();
+  if (last < 2) return [];
+  var n = Math.min(days || 7, last - 1);
+  var vals = s.getRange(last - n + 1, 1, n, METRIC_FIELDS.length + 1).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    var r = { date: String(vals[i][0]) };
+    for (var j = 0; j < METRIC_FIELDS.length; j++) r[METRIC_FIELDS[j]] = Number(vals[i][j + 1] || 0);
+    out.push(r);
+  }
+  return out;
+}
+
 // Recently-seen ids cache to keep dedupe O(1) for the common retry case
 // without scanning the id column on every append. Falls back to a column scan
 // for ids older than the cache window.
@@ -322,15 +428,20 @@ function chatAppend(events) {
       }
       seq += 1;
       var body = String(ev.body || '').slice(0, 1000);
+      // v0.17.0 — column F is the gameTag ('' = main room). The notify flag is
+      // packed into the meta JSON as _n to keep the physical 10-column layout
+      // (logical schema per spec; physical packing documented in the ledger).
+      var meta = ev.meta && typeof ev.meta === 'object' ? ev.meta : {};
+      meta._n = ev.notify ? 1 : 0;
       rows.push([
         seq, id, now,
         String(ev.type || 'message'),
         String(ev.author || 'unknown'),
-        String(ev.channel || 'general'),
+        String(ev.gameTag || ''),
         body,
         String(ev.targetId || ''),
         String(ev.replyTo || ''),
-        ev.meta ? JSON.stringify(ev.meta) : '',
+        JSON.stringify(meta),
       ]);
       recent[id] = seq;
       assigned.push({ id: id, seq: seq, ts: now });
@@ -338,7 +449,11 @@ function chatAppend(events) {
     if (rows.length) {
       s.getRange(s.getLastRow() + 1, 1, rows.length, MSG_HEADER.length).setValues(rows);
     }
-    return { ok: true, assigned: assigned, head: msgHead(s) };
+    var head = msgHead(s);
+    CacheService.getScriptCache().put('chatHead', String(head), 5);   // invalidate/refresh
+    bump('appendCount'); bump('execCount');
+    flushMetrics();
+    return { ok: true, assigned: assigned, head: head };
   } finally {
     lock.releaseLock();
   }
@@ -347,15 +462,24 @@ function chatAppend(events) {
 function rowToEvent(r) {
   var meta = null;
   if (r[9]) { try { meta = JSON.parse(r[9]); } catch (e) { meta = null; } }
+  // v0.17.0 one-room model. Legacy v0.16 rows stored a channel in col F:
+  //   'general' / 'week:N'  -> untagged main-room message
+  //   'game:<id>'           -> gameTag <id>
+  var tag = String(r[5] || '');
+  if (tag === 'general' || tag.indexOf('week:') === 0) tag = '';
+  else if (tag.indexOf('game:') === 0) tag = tag.slice(5);
+  var notify = false;
+  if (meta && meta._n !== undefined) { notify = !!meta._n; delete meta._n; }
   return {
     seq: Number(r[0]), id: String(r[1]), ts: Number(r[2]),
-    type: String(r[3]), author: String(r[4]), channel: String(r[5]),
+    type: String(r[3]), author: String(r[4]), gameTag: tag,
     body: String(r[6] || ''), targetId: String(r[7] || ''), replyTo: String(r[8] || ''),
-    meta: meta,
+    notify: notify, meta: meta,
   };
 }
 
 function chatSince(afterSeq, limit) {
+  bump('sinceCount'); bump('execCount');
   var s = ensureMsgSheet();
   var head = msgHead(s);
   limit = Math.max(1, Math.min(limit || 500, 1000));
