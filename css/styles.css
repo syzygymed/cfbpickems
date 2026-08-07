@@ -872,7 +872,7 @@ label[for="week-show-history"],label:has(#week-show-history){
    Overrides earlier flex-based rules below. */
 .reaction-picker {
   display: grid !important;
-  grid-template-columns: repeat(5, 44px);    /* 5 columns × 3 rows for 15 emojis */
+  grid-template-columns: repeat(5, 44px);    /* 5 columns, auto-flows into extra rows as REACTION_PALETTE grows (18 today) */
   gap: 6px;
   padding: 8px;
   max-width: none !important;
@@ -1249,7 +1249,12 @@ label[for="week-show-history"],label:has(#week-show-history){
 /* ── Chat page ── */
 .chat-pills-scroll{display:flex;gap:6px;overflow-x:auto;padding:2px 0 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
 .chat-pills-scroll::-webkit-scrollbar{display:none}
-.chat-pill{flex:0 0 auto;border:1px solid var(--bg-input);background:var(--bg-card);border-radius:999px;padding:6px 12px;font-size:.78rem;font-weight:600;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;gap:6px}
+/* min-height:40px on ALL pills (CONVENTIONS #17) — was ~28-30px with no floor,
+   under the tap-target minimum. box-sizing keeps the padding from pushing the
+   real height past 40px. Fixed for every pill uniformly (Records + game
+   pills), not just the one that prompted the audit — a row of inconsistently
+   sized buttons is worse than the original problem. */
+.chat-pill{flex:0 0 auto;border:1px solid var(--bg-input);background:var(--bg-card);border-radius:999px;padding:6px 12px;min-height:40px;box-sizing:border-box;font-size:.78rem;font-weight:600;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;gap:6px}
 .chat-pill.active{background:var(--maroon);border-color:var(--maroon);color:#fff}
 .chat-unread-dot{background:#D62828;color:#fff;font-size:.6rem;font-weight:700;border-radius:9px;min-width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;padding:0 4px}
 .chat-pill.active .chat-unread-dot{background:#fff;color:var(--maroon)}
@@ -1300,18 +1305,42 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-input{flex:1;border:1px solid var(--bg-input);background:var(--bg-input);border-radius:12px;padding:9px 12px;font-size:.9rem;font-family:inherit;resize:none;max-height:120px}
 .chat-input:focus{outline:2px solid var(--maroon-light)}
 .chat-send-btn{flex:0 0 40px;width:40px;height:40px;border-radius:50%;border:none;background:var(--maroon);color:#fff;font-size:1rem;cursor:pointer}
-.chat-composer-foot{display:flex;justify-content:space-between;align-items:center;margin-top:4px}
-.chat-emoji-row{display:flex;gap:2px}
+/* position:relative anchors the item G "more emoji" picker (.reaction-picker,
+   reused verbatim from the dashboard's game-reaction picker), which is
+   position:absolute;top:100%;left:0 relative to this row. */
+.chat-composer-foot{display:flex;justify-content:space-between;align-items:center;margin-top:4px;position:relative}
+.chat-emoji-row{display:flex;gap:2px;align-items:center}
 .chat-emoji-insert{background:none;border:none;font-size:1rem;cursor:pointer;padding:2px}
+/* v0.17.3 (caught in review): this inherited .chat-emoji-insert's padding:2px
+   and shrank the font, landing at roughly an 18px tap target against the 40px
+   floor (CONVENTIONS #17). Same class of miss as the .chat-pill fix in v0.17.2. */
+.chat-emoji-more{opacity:.6;font-size:1rem;min-width:40px;min-height:40px;padding:0;
+  display:inline-flex;align-items:center;justify-content:center}
+.chat-emoji-more:hover{opacity:1}
+/* The composer foot sits at the BOTTOM of the chat page, so a picker anchored
+   top:100% opened off-screen underneath the bottom nav (z-index 100) and the
+   user saw nothing happen. Open upward, and clear the nav. */
+.chat-composer-foot .reaction-picker{top:auto;bottom:100%;margin:0 0 4px;z-index:150}
 .chat-char-count{font-size:.65rem;color:#B02A37;font-weight:700}
 .chat-replying,.chat-target-note{font-size:.7rem;color:var(--text-secondary);background:var(--bg-card-alt);border-radius:8px;padding:4px 8px;margin-bottom:6px;display:flex;justify-content:space-between;gap:6px}
 .chat-replying button{background:none;border:none;cursor:pointer;font-size:.7rem}
 .chat-login-note{margin-top:10px;text-align:center;font-size:.8rem;color:var(--text-secondary);background:var(--bg-card);border-radius:var(--card-radius);padding:12px}
 
-/* game-card bubble */
-.chat-bubble-btn{position:relative;background:none;border:1px solid var(--bg-input);border-radius:999px;padding:3px 9px;font-size:.8rem;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
-.chat-bubble-btn.has-unread{border-color:#D62828}
-.chat-bubble-count{font-size:.65rem;font-weight:700;color:var(--text-secondary)}
+/* game-card bubble — item B: three states, distinct at a glance, all seven
+   themes (CSS custom properties only, no hardcoded colors), tap target
+   >=40px (CONVENTIONS #17 — the old padding:3px 9px was well under, same
+   defect class as the .chat-pill fix in batch 2). */
+.chat-bubble-btn{position:relative;background:none;border:1px solid var(--bg-input);border-radius:999px;
+  padding:6px 12px;min-height:40px;box-sizing:border-box;font-size:.8rem;cursor:pointer;
+  display:inline-flex;align-items:center;gap:4px;transition:all var(--transition)}
+.chat-bubble-count{font-size:.68rem;font-weight:700}
+/* Has unread — prominent, filled accent, count visible */
+.chat-bubble-unread{background:var(--maroon);border-color:var(--maroon);color:#fff}
+.chat-bubble-unread .chat-bubble-count{color:#fff}
+/* Zero unread, has messages — muted, existing border style, dimmed */
+.chat-bubble-read{border-color:var(--bg-input);color:var(--text-secondary);opacity:.72}
+/* No messages at all — most subdued, lowest contrast */
+.chat-bubble-empty{border-color:var(--bg-input);color:var(--text-muted);opacity:.42}
 
 /* bottom sheet */
 #chat-sheet-wrap{position:fixed;inset:0;z-index:8000}
@@ -1319,27 +1348,62 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-sheet{position:absolute;left:0;right:0;bottom:0;background:var(--bg);border-radius:18px 18px 0 0;padding:12px 12px calc(12px + env(safe-area-inset-bottom));max-height:82vh;display:flex;flex-direction:column;animation:sheetUp .22s ease-out}
 @keyframes sheetUp{from{transform:translateY(40%)}to{transform:translateY(0)}}
 @media(min-width:700px){.chat-sheet{left:auto;top:0;bottom:0;width:420px;border-radius:18px 0 0 18px;max-height:none;animation:none}}
-.chat-sheet-header{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+.chat-sheet-header{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;
+  border-radius:10px;padding:4px 6px;transition:background var(--transition)}
 .chat-sheet-title{font-family:'Oswald',sans-serif;font-weight:600;color:var(--maroon)}
 .chat-sheet-sub{font-size:.7rem;color:var(--text-muted)}
 .chat-sheet-header-actions{display:flex;gap:6px;align-items:center}
 .chat-sheet-close{background:var(--bg-input);border:none;border-radius:50%;width:30px;height:30px;cursor:pointer}
 .chat-sheet-scroll{flex:1;max-height:none;min-height:180px}
 
-/* dashboard teaser */
+/* Item F — game thread header colors, mirroring the dashboard's covering/
+   trailing/won/lost palette for the CURRENT VIEWER's own pick. Applied to
+   BOTH thread-header surfaces: the bottom-sheet header (.chat-sheet-header)
+   and the main chat page's game-filter header (.chat-view-header).
+   HARD REQUIREMENT: static only, no animation property anywhere in this
+   block — the dashboard's matching classes (.pick-live-covering etc.)
+   deliberately pulse; that reads as noisy in a chat header (spec), so these
+   are dedicated classes, not the pulsing ones with a modifier bolted on. */
+.chat-thread-covering{background:rgba(26,122,63,.10);color:#1A7A3F}
+.chat-thread-trailing{background:rgba(185,28,28,.08);color:#9a3030}
+.chat-thread-even{background:rgba(122,106,90,.10);color:var(--text-secondary)}
+.chat-thread-won{background:var(--win-bg);color:var(--win);font-weight:700}
+.chat-thread-lost{background:var(--loss-bg);color:var(--loss);font-weight:700}
+
+/* dashboard teaser — item D+E: dismissible ambient indicator, no quick-reply */
 .dash-chat-teaser{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.dash-chat-left{display:flex;gap:10px;align-items:center;min-width:0}
+.dash-chat-left{display:flex;gap:10px;align-items:center;min-width:0;flex:1;cursor:pointer}
 .dash-chat-icon{font-size:1.3rem}
 .dash-chat-title{font-family:'Oswald',sans-serif;font-weight:600;color:var(--maroon);display:flex;gap:6px;align-items:center}
 .dash-chat-preview{font-size:.75rem;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:56vw}
+.dash-chat-dismiss{flex:0 0 auto;width:40px;height:40px;min-width:40px;min-height:40px;
+  border:none;background:transparent;color:var(--text-muted);font-size:1rem;
+  border-radius:50%;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+  transition:all var(--transition)}
+.dash-chat-dismiss:hover{background:var(--bg-input);color:var(--text-secondary)}
 
 
 /* ═══ v0.17.0 — one-room chat, notifications, identity ═══ */
 .chat-header-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 .chat-pending{font-size:.7rem}
+/* Retention notice (UN-8x) — below the pill row, above the message stream.
+   Uses the existing text-muted/text-xs utilities for color/size; this rule is
+   spacing only, so it carries no theme risk (no hardcoded colors). */
+.chat-retention-notice{margin:2px 0 8px}
 .chat-view-header{display:flex;justify-content:space-between;align-items:center;gap:8px;
   padding:8px 12px;margin-bottom:8px;background:var(--bg-card);border:1px solid var(--border);
   border-radius:10px;font-size:.82rem}
+/* v0.17.3 (caught in review): .chat-view-header is declared after the
+   .chat-thread-* block at EQUAL specificity, so its background won and the
+   main chat page's game-filter header rendered with NO tint while the bottom
+   sheet rendered correctly — the same class, two different looks. Re-assert
+   here with (0,2,0) so both render paths agree. Still static: no animation. */
+.chat-view-header.chat-thread-covering{background:rgba(26,122,63,.10);color:#1A7A3F}
+.chat-view-header.chat-thread-trailing{background:rgba(185,28,28,.08);color:#9a3030}
+.chat-view-header.chat-thread-even{background:rgba(122,106,90,.10);color:var(--text-secondary)}
+.chat-view-header.chat-thread-won{background:var(--win-bg);color:var(--win);font-weight:700}
+.chat-view-header.chat-thread-lost{background:var(--loss-bg);color:var(--loss);font-weight:700}
+
 .live-pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:#DC2626;
   margin-right:4px;animation:livePulse 1.4s ease-in-out infinite}
 @keyframes livePulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.75)}}
@@ -1368,7 +1432,6 @@ label[for="week-show-history"],label:has(#week-show-history){
 .pick-chip-win{background:#E7F6EC;border-color:#1E7E34;color:#1E7E34}
 .pick-chip-loss{background:#FBEAEA;border-color:#B02A37;color:#B02A37}
 .chat-pinned{font-size:.68rem}
-.chat-seen{font-size:.62rem;color:var(--text-muted);margin-top:2px;text-align:right}
 .chat-quote-static{opacity:.85}
 .chat-gamereact .chat-system-body{font-style:italic}
 .chat-reveal{background:var(--gold-pale);border:1px solid var(--gold);border-radius:12px;padding:10px}
@@ -1395,11 +1458,6 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-accent-swatch{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer}
 .chat-accent-swatch.active{border-color:var(--text);transform:scale(1.12)}
 .chat-accent-none{background:var(--bg-card-alt);color:var(--text-muted);font-size:.7rem}
-/* Dashboard quick-reply */
-.dash-chat-teaser{display:flex;flex-direction:column;gap:8px}
-.dash-chat-left{display:flex;align-items:center;gap:10px;cursor:pointer}
-.dash-chat-quick{display:flex;gap:6px}
-.dash-chat-input{flex:1;font-size:.8rem}
 /* Sheet extras */
 .chat-sheet-header-actions{display:flex;align-items:center;gap:6px}
 .chat-sheet-hint{background:var(--gold-pale);border:1px solid var(--gold);border-radius:8px;
@@ -1462,4 +1520,56 @@ label[for="week-show-history"],label:has(#week-show-history){
   background: linear-gradient(135deg, #fef3c7, #fde68a);
   color: #78350f; border: 1px solid #f59e0b;
   font-size: .88rem; line-height: 1.4;
+}
+
+/* ── v0.17.2 · Lock countdown (signed-out visible) ────────────────────────────
+   Shown on the picks login screen and the dashboard "Go to Picks" prompt. The
+   deadline is the reason to sign in, so it must render before authentication.
+   Contains no pick data — safe on a signed-out surface. */
+.lock-countdown {
+  display: flex; align-items: center; gap: 12px;
+  margin: 0 0 14px; padding: 12px 14px;
+  background: var(--maroon-pale); border: 1px solid var(--maroon-tint);
+  border-left: 4px solid var(--maroon);
+  border-radius: var(--btn-radius);
+  text-align: left;
+}
+.lock-countdown-icon { font-size: 1.4rem; line-height: 1; flex-shrink: 0; }
+.lock-countdown-main {
+  font-weight: 700; font-size: .95rem; color: var(--maroon);
+}
+.lock-countdown-sub {
+  font-size: .74rem; color: var(--text-secondary); margin-top: 2px;
+}
+/* Under 3 hours — raise the urgency, but stay static. No pulse: this sits on
+   a page a player may stare at, and motion here reads as an error state. */
+.lock-countdown-urgent {
+  background: var(--live-bg); border-color: var(--live); border-left-color: var(--live);
+}
+.lock-countdown-urgent .lock-countdown-main { color: var(--live); }
+/* Deadline passed / week locked. */
+.lock-countdown-closed {
+  background: var(--bg-card-alt); border-color: var(--border);
+  border-left-color: var(--text-muted);
+}
+.lock-countdown-closed .lock-countdown-main { color: var(--text-secondary); }
+.lock-countdown-compact {
+  margin-bottom: 12px; padding: 10px 12px;
+}
+.lock-countdown-compact .lock-countdown-main { font-size: .86rem; }
+
+/* ── v0.17.2 · Signed-out chat composer replacement ───────────────────────── */
+.chat-login-prompt {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 10px; padding: 12px 14px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+}
+.chat-login-prompt-text { display: flex; flex-direction: column; gap: 2px; }
+.chat-login-prompt-text strong { font-size: .88rem; color: var(--text-primary); }
+.chat-login-prompt .btn { flex-shrink: 0; min-height: 40px; }
+
+@media (min-width: 600px) {
+  .lock-countdown { padding: 14px 16px; }
+  .lock-countdown-main { font-size: 1.02rem; }
 }

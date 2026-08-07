@@ -25,14 +25,17 @@
  */
 
 import {
-  appendEvents, subscribe, fetchBefore, heartbeat, StaleDeploymentError,
+  appendEvents, subscribe, fetchBefore, StaleDeploymentError,
 } from './chatTransport.js';
 import { isBackendConfigured } from './backend.js';
+// v0.17.3 — chat retention (UN-8x) reads settings.chatRetentionDays through
+// the storage seam. Safe: storage.js imports only data-model.js + backend.js,
+// neither of which imports chat.js, so this cannot cycle.
+import { getSettings } from './storage.js';
 
 // ── Device-local persistence keys (AD-12) ─────────────────────────────────────
 const K_LASTSEEN = 'cfbp_chat_lastseen2';   // { seq, byTag: { gameId: seq } }
 const K_OUTBOX   = 'cfbp_chat_outbox2';
-const K_SEENMAP  = 'cfbp_chat_seenmap';     // { playerId: lastSeenSeq } (from presence)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
@@ -47,10 +50,7 @@ const S = {
   lastError: '',
   viewOpen: false,
   selfId: null,
-  presence: [],              // [{playerId, ts, seen}]
-  seenMap: {},               // playerId -> best-known lastSeenSeq
   unsub: null,
-  presenceTimer: null,
   subs: new Set(),
   backfillLow: null,
 };
@@ -60,7 +60,81 @@ export function onChat(fn) { S.subs.add(fn); return () => S.subs.delete(fn); }
 export function chatStatus() {
   return { head: S.head, offline: S.offline, staleDeployment: S.staleDeployment,
            lastError: S.lastError, outbox: S.outbox.length, failed: S.failed.size,
-           presence: S.presence, mode: roomMode() };
+           mode: roomMode() };
+}
+
+// ── Commissioner chat on/off toggle (batch 3+4 item A) ────────────────────────
+// A synced setting (settings.chatEnabled, storage seam, AD-02) — NOT
+// device-local, because every player must see the same on/off state. Default
+// TRUE: chat is on today, and a missing value (every settings blob written
+// before this field existed) must never silently disable it. `!== false`
+// rather than a truthy check so any non-boolean garbage in an old blob still
+// reads as enabled, not disabled (CONVENTIONS #7 — defensive coercion at a
+// data boundary).
+export function isChatEnabled() {
+  return getSettings().chatEnabled !== false;
+}
+
+// ── Chat retention (UN-8x) — CLIENT-SIDE HIDE ONLY ────────────────────────────
+// Drew's call, not the destructive variant: the backend (backend/Code.gs)
+// exposes only chatAppend/chatSince/chatBefore/chatHead/chatMetrics — no
+// row-removal endpoint — so a real "delete" would need a new endpoint and a
+// redeploy (RG-09's exact failure mechanism) for a cosmetic gain at 6-player
+// scale. Instead: messages older than the window stop RENDERING. Rows stay in
+// the Sheet forever; flipping the setting back off restores the full history
+// with zero data loss. A synced setting (goes through the storage seam via
+// getSettings/saveSetting, AD-02) so every player sees the same window —
+// never a device-local key. Default-when-missing: 0/absent = OFF.
+export function getRetentionDays() {
+  return Number(getSettings().chatRetentionDays) || 0;
+}
+
+/** Pinned (Hall of Records) messages are ALWAYS visible regardless of age —
+ *  that is the entire point of pinning something. Never hidden by retention. */
+export function isHiddenByRetention(m) {
+  return _hiddenBy(retentionCutoff(), m);
+}
+
+/**
+ * Resolve the retention cutoff ONCE, for callers that then test many messages.
+ *
+ * v0.17.2 perf: getRetentionDays() reads getSettings(), which spreads
+ * DEFAULT_SETTINGS over a load() — and in local mode that is a JSON.parse per
+ * call. isUnreadFor() runs per message, unreadCount() runs per pill (up to 11),
+ * and updateChatBadges() runs on the poll loop, so calling it per-message cost
+ * ~1.9ms per 800 messages even with retention OFF. Hoist it.
+ *
+ * Returns 0 when retention is disabled — callers treat 0 as "hide nothing".
+ */
+export function retentionCutoff() {
+  const days = getRetentionDays();
+  return days > 0 ? Date.now() - days * 86400000 : 0;
+}
+
+/** Pure predicate against a pre-resolved cutoff. Pinned is always visible. */
+function _hiddenBy(cutoff, m) {
+  if (!cutoff) return false;
+  if (m?.pinned) return false;
+  return (m?.ts || 0) < cutoff;
+}
+
+/** Commissioner Data-tab card stats: how many messages the current window
+ *  WOULD hide/protect, and the date range they span. Purely informational —
+ *  computing this never mutates anything. */
+export function retentionStats() {
+  const days = getRetentionDays();
+  if (days <= 0) return { enabled: false, days: 0, hiddenCount: 0, protectedCount: 0, oldestTs: null, newestTs: null };
+  const cutoff = Date.now() - days * 86400000;
+  let hiddenCount = 0, protectedCount = 0, oldestTs = null, newestTs = null;
+  S.items.forEach(m => {
+    if (m.type !== 'message' || m.deleted) return;
+    if ((m.ts || 0) >= cutoff) return;                 // not old enough to be affected either way
+    if (m.pinned) { protectedCount++; return; }
+    hiddenCount++;
+    if (oldestTs === null || m.ts < oldestTs) oldestTs = m.ts;
+    if (newestTs === null || m.ts > newestTs) newestTs = m.ts;
+  });
+  return { enabled: true, days, hiddenCount, protectedCount, oldestTs, newestTs };
 }
 
 // ── Fold ──────────────────────────────────────────────────────────────────────
@@ -142,7 +216,12 @@ export function ingest(events, head) {
 
 function orderKey(m) { return (m.ts || 0) * 1e7 + (m.seq || 0); }
 
-/** Chronological list. filter: {tag:'all'|''|gameId, pinned, mentionsOf, types} */
+/** Chronological list. filter: {tag:'all'|''|gameId, pinned, mentionsOf, types,
+ *  respectRetention}. `respectRetention` is opt-in and defaults to false so
+ *  existing non-display callers (the weekly digest, SCRIBE's pre-kick lookup)
+ *  keep reading the full history unless they explicitly ask to be filtered —
+ *  retention is a rendering preference, not a data-availability change. Chat
+ *  page render paths pass `respectRetention: true`. */
 export function getMessages(filter = {}) {
   const tag = filter.tag ?? 'all';
   const out = [];
@@ -150,6 +229,7 @@ export function getMessages(filter = {}) {
     if (filter.types && !filter.types.includes(m.type)) return;
     if (tag !== 'all' && (m.gameTag || '') !== tag) return;
     if (filter.pinned && !m.pinned) return;
+    if (filter.respectRetention && isHiddenByRetention(m)) return;
     if (filter.mentionsOf) {
       const mentioned = (m.meta?.mentions || []).includes(filter.mentionsOf);
       const replyToMe = m.replyTo && S.items.get(m.replyTo)?.author === filter.mentionsOf;
@@ -245,7 +325,11 @@ function scheduleFlush() {
 }
 
 export async function flushOutbox() {
-  if (!S.outbox.length || !isBackendConfigured()) return;
+  // "Off" means zero network activity, not just zero reads — a queued send
+  // (e.g. a SCRIBE post staged from the commissioner panel while chat is
+  // hidden) waits in the outbox, persisted, and flushes automatically the
+  // moment chat is re-enabled. Nothing is lost (item A: "data is preserved").
+  if (!S.outbox.length || !isBackendConfigured() || !isChatEnabled()) return;
   const batch = S.outbox.splice(0, S.outbox.length);
   try {
     const { assigned, head } = await appendEvents(batch.map(o => o.ev));
@@ -312,10 +396,10 @@ export function setViewOpen(open) { S.viewOpen = !!open; }
 /** Back-compat shim for app.js ('active' when the chat tab is showing). */
 export function setPollMode(mode) { setViewOpen(mode === 'active'); }
 
-export function initChat(selfId) {
-  S.selfId = selfId || S.selfId;
-  loadOutbox();
-  try { S.seenMap = JSON.parse(localStorage.getItem(K_SEENMAP) || '{}'); } catch { S.seenMap = {}; }
+/** Force-(re)subscribes regardless of current subscription state — used by
+ *  initChat() (selfId may have changed on re-login) and by the enabled-toggle
+ *  when going from OFF to ON. Unconditional: callers gate on isChatEnabled(). */
+function _subscribeNow() {
   if (S.unsub) S.unsub();
   S.unsub = subscribe(
     (events, head) => ingest(events, head),
@@ -333,43 +417,57 @@ export function initChat(selfId) {
       },
     }
   );
-  flushOutbox();
-  startPresence();
+}
+
+export function initChat(selfId) {
+  S.selfId = selfId || S.selfId;
+  loadOutbox();
+  // v0.17.2 — presence was removed; drop its orphaned device-local key so it
+  // doesn't linger as a mystery on already-deployed devices.
+  try { localStorage.removeItem('cfbp_chat_seenmap'); } catch {}
+  // Batch 3+4 item A — chat OFF must mean ZERO network activity, not a slower
+  // poll. roomMode()==='closed' still ticks every 60s forever (INTERVALS in
+  // chatTransport.js) — that is NOT "stopped", it is "throttled", and it keeps
+  // burning Apps Script quota indefinitely. Only NOT subscribing at all (no
+  // timer scheduled) satisfies "stop chat polling entirely."
+  if (isChatEnabled()) { _subscribeNow(); flushOutbox(); }
+  else if (S.unsub) { S.unsub(); S.unsub = null; }
+}
+
+/**
+ * Starts or stops the poll loop to match the current settings.chatEnabled
+ * value. Idempotent — safe to call on every navigation and on a periodic
+ * timer without thrashing an already-correct subscription (unlike initChat(),
+ * which always force-resubscribes). This is the function the commissioner's
+ * Settings toggle calls for an immediate same-device effect, and the one a
+ * periodic UI-sync tick calls to catch a value that changed via hydrate.
+ */
+export function refreshChatEnabled() {
+  const enabled = isChatEnabled();
+  if (enabled && !S.unsub) { _subscribeNow(); flushOutbox(); }
+  else if (!enabled && S.unsub) { S.unsub(); S.unsub = null; }
 }
 
 export async function backfill(limit = 100) {
-  if (!isBackendConfigured() || S.backfillLow === null || S.backfillLow <= 1) return 0;
+  // Reachable only from the "load earlier" control, which is hidden while
+  // chat is off — guarded anyway so a stray call can never cause traffic.
+  if (!isBackendConfigured() || !isChatEnabled() || S.backfillLow === null || S.backfillLow <= 1) return 0;
   try {
     const { events } = await fetchBefore(S.backfillLow, limit);
     return ingest(events);
   } catch (err) { handleTransportError(err); return 0; }
 }
 
-// ── Presence + read receipts ──────────────────────────────────────────────────
-function startPresence() {
-  if (S.presenceTimer) clearInterval(S.presenceTimer);
-  const beat = async () => {
-    if (!S.selfId || !isBackendConfigured() || (typeof document !== 'undefined' && document.hidden)) return;
-    try {
-      const { present } = await heartbeat(S.selfId, getLastSeen().seq);
-      S.presence = present;
-      let changed = false;
-      present.forEach(p => {
-        if ((S.seenMap[p.playerId] || 0) < (p.seen || 0)) { S.seenMap[p.playerId] = p.seen; changed = true; }
-      });
-      if (changed) { try { localStorage.setItem(K_SEENMAP, JSON.stringify(S.seenMap)); } catch {} }
-      notify('presence', { present });
-    } catch { /* presence is best-effort */ }
-  };
-  beat();
-  S.presenceTimer = setInterval(beat, 60000 + Math.random() * 10000);
-}
-export function presenceList() { return S.presence; }
-/** How many OTHER players are known to have seen a given seq. */
-export function seenByCount(seq, selfId) {
-  if (!seq) return 0;
-  return Object.entries(S.seenMap).filter(([pid, s]) => pid !== selfId && s >= seq).length;
-}
+// ── Presence + read receipts: REMOVED in v0.17.2 (AD-19 amended) ─────────────
+// "N here now" and "seen by k" both rode a 90s CacheService heartbeat, so the
+// indicator could be wrong by up to 90 seconds — someone who closed the app a
+// minute ago still read as present. Spec §4.5: a wrong presence indicator is
+// worse than none, and reliable "actively viewing" detection is not achievable
+// on a polling transport. Do not re-add without re-opening AD-19.
+//
+// `lastSeenSeq` / getLastSeen / markSeen / unreadCount below are a SEPARATE
+// feature (device-local unread counts, AD-12). Presence merely piggybacked on
+// lastSeenSeq; unread tracking never depended on presence and still works.
 
 // ── Unread (notifying events only — ambient never badges) ─────────────────────
 export function getLastSeen() {
@@ -378,19 +476,36 @@ export function getLastSeen() {
 }
 function putLastSeen(v) { try { localStorage.setItem(K_LASTSEEN, JSON.stringify(v)); } catch {} }
 
+/**
+ * Advance the read position. MONOTONIC — a cursor never moves backward.
+ *
+ * v0.17.3 (caught in review, pre-deploy): this used to assign S.head
+ * unconditionally. S.head is 0 until the first poll returns, and Apps Script
+ * cold starts run 10-20s (ledger §5) while the chat mark timer fires at 1s.
+ * A player who opened the app, tapped Chat during the cold start, and backed
+ * out had their cursor reset to 0 — so every message they had already read
+ * counted as unread again, and every game bubble lit up claiming unread they
+ * cleared yesterday. Nothing in this app ever legitimately rewinds a cursor.
+ *
+ * Guarded by loadtest §[17b].
+ */
 export function markSeen(tag = 'all') {
   const ls = getLastSeen();
+  const fwd = (cur) => Math.max(Number(cur) || 0, S.head);
   if (tag === 'all') {
-    ls.seq = S.head;
-    Object.keys(ls.byTag).forEach(t => { ls.byTag[t] = S.head; });
+    ls.seq = fwd(ls.seq);
+    Object.keys(ls.byTag).forEach(t => { ls.byTag[t] = fwd(ls.byTag[t]); });
   } else {
-    ls.byTag[tag] = S.head;
+    ls.byTag[tag] = fwd(ls.byTag[tag]);
   }
   putLastSeen(ls);
   notify('seen', { tag });
 }
 
-function isUnreadFor(m, selfId, afterSeq) {
+function isUnreadFor(m, selfId, afterSeq, cutoff = retentionCutoff()) {
+  // A message hidden by retention can never count toward unread — a player
+  // who can't scroll to it should never see a badge promising it's there.
+  if (_hiddenBy(cutoff, m)) return false;
   return m.type === 'message' && !m.deleted && m.notify &&
          typeof m.seq === 'number' && m.seq > afterSeq && m.author !== selfId;
 }
@@ -398,12 +513,33 @@ function isUnreadFor(m, selfId, afterSeq) {
 export function unreadCount(selfId, tag = 'all') {
   const ls = getLastSeen();
   const after = tag === 'all' ? ls.seq : (ls.byTag[tag] ?? ls.seq);
+  const cutoff = retentionCutoff();          // resolved once, not per message
   let n = 0;
   S.items.forEach(m => {
     if (tag !== 'all' && (m.gameTag || '') !== tag) return;
-    if (isUnreadFor(m, selfId, after)) n++;
+    if (isUnreadFor(m, selfId, after, cutoff)) n++;
   });
   return n;
+}
+
+/**
+ * Distinct author ids behind a tag's UNREAD count, in first-seen order —
+ * same predicate as unreadCount(), just collecting authors instead of a
+ * tally. Feeds the game-card bubble's attribution (item B): "who is this
+ * unread FROM" rather than just "how many".
+ */
+export function unreadAuthors(selfId, tag = 'all') {
+  const ls = getLastSeen();
+  const after = tag === 'all' ? ls.seq : (ls.byTag[tag] ?? ls.seq);
+  const cutoff = retentionCutoff();
+  const seen = new Set();
+  const out = [];
+  S.items.forEach(m => {
+    if (tag !== 'all' && (m.gameTag || '') !== tag) return;
+    if (!isUnreadFor(m, selfId, after, cutoff)) return;
+    if (!seen.has(m.author)) { seen.add(m.author); out.push(m.author); }
+  });
+  return out;
 }
 
 export function mentionUnreadCount(selfId) {
@@ -415,6 +551,7 @@ export function latestNotifying(selfId) {
   let best = null;
   S.items.forEach(m => {
     if (m.type !== 'message' || m.deleted || !m.notify) return;
+    if (isHiddenByRetention(m)) return;                // don't preview a message the reader can't open
     if (!best || orderKey(m) > orderKey(best)) best = m;
   });
   return best;
@@ -512,10 +649,15 @@ export function chatDigest(startMs, endMs, ctx = {}) {
 
 // ── Test hooks ────────────────────────────────────────────────────────────────
 export function _resetForTest() {
+  if (S.unsub) { S.unsub(); S.unsub = null; }             // no dangling timers across test sections
   S.items.clear(); S.buffered.clear(); S.head = 0; S.outbox = []; S.failed.clear();
-  S.offline = false; S.staleDeployment = false; S.presence = []; S.seenMap = {};
+  S.offline = false; S.staleDeployment = false;
   S.backfillLow = null; S.viewOpen = false;
 }
+/** Item A (batch 3+4) — the only way to observe from OUTSIDE this module
+ *  whether the poll loop is actually running (S.unsub is intentionally
+ *  private). Answers the literal hazard: "prove polling stops." */
+export function _isPollingActiveForTest() { return !!S.unsub; }
 export function _foldedSnapshot() {
   const list = getMessages({ tag: 'all' }).map(m => ({
     id: m.id, seq: m.seq, ts: m.ts, author: m.author, tag: m.gameTag, body: m.body,

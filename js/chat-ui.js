@@ -16,8 +16,13 @@
  *      callout + SCRIBE unprompted callout), Extra Point, week final (+ Hall
  *      of Records auto-promotion), all with the pre-lock no-leak HARD RULE
  *   H. SCRIBE — an active member of the league, not a summonable bot: it
- *      documents on its own schedule, appears in presence, and answers when
+ *      documents on its own schedule, is always on duty, and answers when
  *      addressed. Live-game observations ride the existing score poll.
+ *
+ * v0.17.2 — player presence ("N here now") and read receipts ("seen by k") were
+ * removed; see the note in chat.js and the amended AD-19. The header subtitle
+ * keeps SCRIBE's standing "on duty" framing (UN-67), which was never presence-
+ * derived — it was static copy concatenated onto the presence line.
  *
  * All state lives in chat.js; this module renders and forwards intents.
  */
@@ -26,8 +31,9 @@ import {
   initChat, onChat, chatStatus, getMessages, getMessage, resolveTag,
   sendMessage, sendEvent, editMessage, deleteMessage, toggleReact, pinMessage,
   sendGameReact, retryFailed, isFailed, isPending,
-  unreadCount, mentionUnreadCount, markSeen, getLastSeen, latestNotifying,
-  presenceList, seenByCount, backfill, chatDigest as _digest, setViewOpen,
+  unreadCount, unreadAuthors, mentionUnreadCount, markSeen, getLastSeen, latestNotifying,
+  backfill, chatDigest as _digest, setViewOpen,
+  getRetentionDays, isChatEnabled,
 } from './chat.js';
 import { scribeInspectMessage, scribeTrigger } from './scribeLines.js';
 import {
@@ -36,12 +42,15 @@ import {
   getAccent, setAccent, getAccentFor, getChatNick, setChatNick, getChatNickFor,
   getNotifPrefs, setNotifPrefs,
 } from './storage.js';
-import { formatSpread, formatWeekLabel, GAME_STATUS } from './data-model.js';
+import { formatSpread, formatWeekLabel, GAME_STATUS, buildAbbrMap, REACTION_PALETTE } from './data-model.js';
 import { calculateAtsWinner } from './scoring.js';
 
 export const chatDigest = _digest;
 
-const QUICK_EMOJI = ['💀', '😂', '🔥', '🍺', '🤡', '👀'];
+// AD-20 extended to emoji (item G): QUICK_EMOJI is a DERIVED subset of the
+// one shared palette in data-model.js, never an independent literal. The full
+// REACTION_PALETTE is reachable from the composer's "more emoji" picker.
+const QUICK_EMOJI = REACTION_PALETTE.slice(0, 6);
 const EDIT_WINDOW_MS = 5 * 60 * 1000;
 const ACCENTS = ['#B91C1C', '#C2410C', '#A16207', '#15803D', '#0E7490', '#1D4ED8', '#7C3AED', '#BE185D'];
 
@@ -55,11 +64,26 @@ const U = {
   toastQueue: [],
   toastShowing: false,
   prefsOpen: false,
+  returnToChat: false,      // set when a signed-out reader taps "Log in" in chat
+  returnFilter: null,       // the filter they were reading, restored after login
+  returnAt: 0,              // when it was set — the intent expires (see RETURN_WINDOW_MS)
 };
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+
+/**
+ * Guarded localStorage. These are device-local UI hints (AD-12) — never seam
+ * keys — so failure is always safe to swallow.
+ *
+ * v0.17.2 (iOS fix): iOS Safari in Private Browsing throws on localStorage
+ * access. chat.js already wrapped its calls; chat-ui.js did not. The unguarded
+ * getItem on the game-sheet open path meant tapping a dashboard chat bubble
+ * threw before the sheet rendered — the reported "nothing happens on mobile".
+ */
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch { /* private browsing */ } }
 function me() { const s = getSession(); return (s?.playerId && s?.playerVerified) ? s.playerId : null; }
 function nameOf(id) {
   if (id === 'scribe') return 'S.C.R.I.B.E.';
@@ -91,12 +115,54 @@ function gameById(id) {
   }
   return null;
 }
-function gameShort(g) {
-  const abbr = t => (t || '').split(' ').pop().slice(0, 12);
+/**
+ * Per-render memo of slate → abbreviation map, keyed by weekId.
+ *
+ * buildAbbrMap walks the whole slate and runs a dedup pass, so it is far too
+ * expensive to call once per rendered row. gameShort() is invoked from four
+ * render-loop sites and renderChatPage() re-runs on every inbound chat event,
+ * so the uncached version re-derived the same map dozens of times per pass.
+ *
+ * Cleared at the top of ALL THREE render entry points that can reach gameShort:
+ * renderChatPage(), renderPillsOnly(), and renderSheetMessages(). The map is only
+ * ever a within-pass cache, so a mid-session slate edit can never be served
+ * stale. If you add a fourth render path, clear it there too — loadtest section
+ * [8g] asserts the count is exactly 3 and will fail until you update it.
+ */
+const _abbrMemo = new Map();
+function abbrMapFor(weekId, fallbackGames) {
+  if (weekId && _abbrMemo.has(weekId)) return _abbrMemo.get(weekId);
+  const slate = weekId ? getGames(weekId) : [];
+  // Only a real slate gets memoized. A map built from the single-game fallback
+  // describes that game, not the week, so caching it under the weekId would
+  // hand the wrong map to the next game in the same week.
+  if (!slate.length) return buildAbbrMap(fallbackGames || []);
+  const map = buildAbbrMap(slate);
+  _abbrMemo.set(weekId, map);
+  return map;
+}
+
+/**
+ * Away/Home shorthand for a game, using the SAME abbreviation source as the
+ * compact dashboard (data-model.js). Built from the game's own week so the
+ * dedup pass matches what the dashboard renders for that slate.
+ *
+ * v0.17.2: replaced a local `name.split(' ').pop()` heuristic that produced
+ * wrong shorthand for multi-word schools — "Southern California" rendered as
+ * "California", "Arkansas State" as "State". Never reintroduce a second
+ * mapping here; import from data-model.js.
+ */
+function gameShort(g, week) {
+  if (!g) return '';
+  const map = abbrMapFor(week?.weekId, [g]);
+  const abbr = t => map.get(t) || t || '';
   return `${abbr(g.awayTeam)}/${abbr(g.homeTeam)}`;
 }
 function chatPageActive() {
   return typeof document !== 'undefined' && !!document.querySelector('#page-chat.active');
+}
+function dashboardPageActive() {
+  return typeof document !== 'undefined' && !!document.querySelector('#page-dashboard.active');
 }
 
 // ── Pick indicator (Drew: visual context in game threads) ─────────────────────
@@ -115,7 +181,51 @@ function pickChip(authorId, gameTag) {
     const ats = found.game.atsWinner ?? calculateAtsWinner(found.game);
     if (ats && ats !== 'no_decision') cls += pick.selectedTeam === ats ? ' pick-chip-win' : ' pick-chip-loss';
   }
-  return `<span class="${cls}" title="${esc(nameOf(authorId))} picked ${esc(pick.selectedTeam)}">⚡ ${esc(pick.selectedTeam.split(' ').pop())}</span>`;
+  // Shorthand comes from the shared slate map — never a local heuristic. The
+  // full school name stays in the title attribute, so the chip is short and
+  // the hover is unambiguous.
+  const short = abbrMapFor(found.week?.weekId, [found.game]).get(pick.selectedTeam) || pick.selectedTeam;
+  return `<span class="${cls}" title="${esc(nameOf(authorId))} picked ${esc(pick.selectedTeam)}">⚡ ${esc(short)}</span>`;
+}
+
+// ── Game thread header colors (item F) ─────────────────────────────────────
+/**
+ * The four dashboard-mirrored states, computed from the CURRENT VIEWER's own
+ * pick — blind-rule-safe by construction, since a player's own pick is
+ * always visible to themselves regardless of lock status (only OTHER
+ * players' picks are lock-gated, UN-57). No pick, or a game that hasn't
+ * gone live/final yet, returns '' (no color, structural header only).
+ *
+ * Reuses the dashboard's OWN color logic rather than reimplementing it:
+ * `livePickStatus(pick, game)` lives in app.js (private, not exported — and
+ * app.js already imports chat-ui.js, so chat-ui.js importing app.js back
+ * would be a cycle). app.js exposes it on `window.livePickStatus`, the same
+ * bridge pattern already used for window.navigateTo/window.showToast. If the
+ * bridge isn't up yet (defensive only — by the time a user can tap into a
+ * game thread, app.js's module-level code has long since run), this
+ * degrades to no color rather than throwing.
+ *
+ * HARD REQUIREMENT: static only, no pulse. The dashboard's live states
+ * deliberately animate; that reads as noisy in a chat header, so these are
+ * dedicated `.chat-thread-*` classes with no `animation` property at all —
+ * NOT the pulsing `.pick-live-covering` / `.dc-chip-live-covering` classes.
+ */
+function gameThreadHeaderClass(pick, g) {
+  if (!pick || !g) return '';
+  if (g.status === GAME_STATUS.LIVE) {
+    const fn = (typeof window !== 'undefined') ? window.livePickStatus : null;
+    const ls = typeof fn === 'function' ? fn(pick, g) : null;
+    if (ls === 'covering') return ' chat-thread-covering';
+    if (ls === 'trailing') return ' chat-thread-trailing';
+    if (ls === 'even') return ' chat-thread-even';
+    return '';
+  }
+  if (g.status === GAME_STATUS.FINAL) {
+    const ats = g.atsWinner ?? calculateAtsWinner(g);
+    if (!ats || ats === 'no_decision') return '';
+    return pick.selectedTeam === ats ? ' chat-thread-won' : ' chat-thread-lost';
+  }
+  return '';
 }
 
 // ── Notifications (TRIAL — no push) ───────────────────────────────────────────
@@ -156,9 +266,30 @@ function navToChat() {
   document.querySelector('.nav-item[data-tab="chat"]')?.click();
 }
 
+/**
+ * Item A — chat OFF must never leave a player stranded on a dead chat page.
+ * Bounces to Dashboard with a toast. Uses the same window.* bridge pattern
+ * already established for crossing the app.js/chat-ui.js boundary without a
+ * circular import (see bindLoginPrompt's window.navigateTo usage) — app.js
+ * exposes both window.navigateTo and window.showToast for exactly this.
+ */
+function redirectChatDisabled() {
+  if (typeof window !== 'undefined' && typeof window.showToast === 'function') {
+    window.showToast('Chat has been turned off by the commissioner.', 'warning');
+  }
+  if (typeof window !== 'undefined' && typeof window.navigateTo === 'function') window.navigateTo('dashboard');
+  else document.querySelector('.nav-item[data-tab="dashboard"]')?.click();
+}
+
 export function updateChatBadges() {
   const self = me();
-  const n = self ? unreadCount(self, 'all') : 0;
+  // v0.17.3 (caught in review): this was the FIFTH surface item A missed. With
+  // chat off league-wide it still wrote the document title "(7) IRB Pick 'Ems"
+  // and called navigator.setAppBadge(7) — which PERSISTS on the installed PWA
+  // home-screen icon. A player taps in to clear a "7" and finds no Chat nav
+  // entry, no bubbles, nothing to clear. n = 0 already drives the correct
+  // clear on all three sub-surfaces below.
+  const n = (self && isChatEnabled()) ? unreadCount(self, 'all') : 0;
   // nav badge
   document.querySelectorAll('.nav-item[data-tab="chat"]').forEach(btn => {
     let b = btn.querySelector('.nav-unread');
@@ -173,8 +304,14 @@ export function updateChatBadges() {
     document.title = n > 0 ? `(${n > 99 ? '99+' : n}) ${base}` : base;
   } catch {}
   // installed-PWA icon badge (not push — no permissions, degrades silently)
+  // v0.17.2: these return Promises. A rejection escapes try/catch and lands as
+  // an unhandled rejection (CONVENTIONS #4), which is exactly the class of
+  // silent iOS breakage we were hunting. Catch the promise, not just the throw.
   try {
-    if ('setAppBadge' in navigator) n > 0 ? navigator.setAppBadge(n) : navigator.clearAppBadge();
+    if (typeof navigator !== 'undefined' && 'setAppBadge' in navigator) {
+      const p = n > 0 ? navigator.setAppBadge(n) : navigator.clearAppBadge?.();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
   } catch {}
 }
 
@@ -182,7 +319,9 @@ export function updateChatBadges() {
 function activeGameTags() {
   // Games worth a pill: any tagged traffic, or live games on the current slate.
   const tags = new Map();   // gameId -> lastTs
-  getMessages({ tag: 'all' }).forEach(m => {
+  // respectRetention: a game whose entire thread is hidden must not get a pill
+  // that opens to an empty room.
+  getMessages({ tag: 'all', respectRetention: true }).forEach(m => {
     if (m.gameTag) tags.set(m.gameTag, Math.max(tags.get(m.gameTag) || 0, m.ts || 0));
   });
   const wk = getCurrentWeek();
@@ -201,16 +340,38 @@ function pillsHTML() {
   // separate filter view for them. The "Locker Room" pill covers all messages.
   let html = `
     <button class="chat-pill${U.filter === 'all' ? ' active' : ''}" data-chat-filter="all">Locker Room ${dot(mainUnread)}</button>
-    <button class="chat-pill${U.filter === 'records' ? ' active' : ''}" data-chat-filter="records" title="Hall of Records">🏛</button>`;
+    <button class="chat-pill${U.filter === 'records' ? ' active' : ''}" data-chat-filter="records" title="Hall of Records">🏛 Records</button>`;
   activeGameTags().forEach(tag => {
     const found = gameById(tag);
     if (!found) return;
     const live = found.game.status === GAME_STATUS.LIVE;
     const n = self ? unreadCount(self, tag) : 0;
     html += `<button class="chat-pill${U.filter === tag ? ' active' : ''}${live ? ' chat-pill-live' : ''}" data-chat-filter="${esc(tag)}">
-      ${live ? '<span class="live-pulse"></span>' : ''}${esc(gameShort(found.game))} ${dot(n)}</button>`;
+      ${live ? '<span class="live-pulse"></span>' : ''}${esc(gameShort(found.game, found.week))} ${dot(n)}</button>`;
   });
   return `<div class="chat-pills-scroll">${html}</div>`;
+}
+
+/**
+ * Player-visible retention notice (UN-8x). A player who scrolls back and hits
+ * a wall deserves a calm factual explanation, not a mystery — shown to
+ * everyone when the commissioner's retention window is ON, absent entirely
+ * when it's OFF. Static copy, no user data, nothing to escape.
+ */
+/**
+ * v0.17.2: with retention on, "↑ load earlier" is a dead control — it fires a
+ * real Apps Script round-trip and then renders nothing, because everything it
+ * backfills is older than the cutoff. Worse, it sits directly under a notice
+ * saying "Showing the last 7 days", so the UI contradicts itself. Hide it.
+ */
+function retentionOn() {
+  try { return getRetentionDays() > 0; } catch { return false; }
+}
+
+function retentionNoticeHTML() {
+  const days = getRetentionDays();
+  if (days <= 0) return '';
+  return `<div class="chat-retention-notice text-muted text-xs">Showing the last ${days} days. 🏛 Pinned messages are always kept.</div>`;
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
@@ -243,8 +404,9 @@ function tagChipHTML(m) {
   if (!m.gameTag || U.filter === m.gameTag) return '';
   const found = gameById(m.gameTag);
   if (!found) return '';
-  const spr = formatSpread(found.game.lockedSpread ?? found.game.spread, found.game.favorite, found.game) || '';
-  return `<button class="chat-game-chip" data-chat-filter="${esc(m.gameTag)}">${esc(gameShort(found.game))}${spr ? ' ' + esc(spr) : ''}</button>`;
+  // v0.17.2: spread removed from message chips — it's redundant with the game
+  // thread header card and the dashboard. Chips show matchup shorthand only.
+  return `<button class="chat-game-chip" data-chat-filter="${esc(m.gameTag)}">${esc(gameShort(found.game, found.week))}</button>`;
 }
 
 function calloutEligible(m) {
@@ -276,7 +438,6 @@ function messageHTML(m, self, showNewDivider) {
   const pending = isPending(m.id);
   const canEdit = mine && !m.deleted && Date.now() - (m.ts || 0) < EDIT_WINDOW_MS;
   const accent = accentOf(m.author);
-  const seen = mine && m.seq ? seenByCount(m.seq, self) : 0;
 
   return `${showNewDivider ? '<div class="chat-new-divider"><span>NEW</span></div>' : ''}
   <div class="chat-msg${mine ? ' chat-mine' : ''}${scribe ? ' chat-scribe' : ''}${pending ? ' is-pending' : ''}${failed ? ' is-failed' : ''}" data-mid="${esc(m.id)}">
@@ -295,7 +456,6 @@ function messageHTML(m, self, showNewDivider) {
       ${quoteHTML(m)}
       <div class="chat-bubble">${m.deleted ? '<span class="chat-tombstone">🪦 message withdrawn</span>' : bodyHTML(m).replace(/\n/g, '<br>')}</div>
       ${reactionsHTML(m, self)}
-      ${mine && seen > 0 ? `<div class="chat-seen">seen by ${seen}</div>` : ''}
       ${m.deleted ? '' : `<div class="chat-actions">
         ${QUICK_EMOJI.slice(0, 3).map(e => `<button class="chat-act" data-react="${e}" data-target="${esc(m.id)}">${e}</button>`).join('')}
         <button class="chat-act" data-reply="${esc(m.id)}" title="Reply">↩</button>
@@ -331,7 +491,7 @@ function coalesceStream(list) {
 function gamereactRunHTML(run) {
   const parts = run.items.map(m => {
     const found = gameById(m.gameTag);
-    return `${esc(m.meta?.emoji || '👀')} ${found ? esc(gameShort(found.game)) : ''}`;
+    return `${esc(m.meta?.emoji || '👀')} ${found ? esc(gameShort(found.game, found.week)) : ''}`;
   }).join(' · ');
   return `<div class="chat-msg chat-system chat-gamereact" data-ts="${run.ts}">
     <div class="chat-system-body">${esc(nameOf(run.author))} reacted &nbsp;${parts}</div>
@@ -342,20 +502,31 @@ function gamereactRunHTML(run) {
 // ── Main chat page ────────────────────────────────────────────────────────────
 export function renderChatPage() {
   const c = document.getElementById('page-chat'); if (!c) return;
+  // Item A — chat OFF hides this surface entirely. Guard here (not just at
+  // the nav level) so ANY caller of renderChatPage() — navigateTo(), a stray
+  // onChat re-render, resumeChatAfterLogin() — bounces rather than rendering
+  // a page whose polling has already been stopped.
+  if (!isChatEnabled()) { redirectChatDisabled(); return; }
+  _abbrMemo.clear();                                 // per-pass cache only (see abbrMapFor)
   const self = me();
   const st = chatStatus();
   setViewOpen(true);
 
+  // respectRetention: true — the rendered stream honors the commissioner's
+  // window (UN-8x). Harmless to pass on the 'records' filter too: pinned
+  // messages are exempt from retention by construction (isHiddenByRetention),
+  // so Hall of Records is unaffected either way — passing it everywhere keeps
+  // the intent uniform instead of relying on that exemption silently.
   let list;
-  if (U.filter === 'records') list = getMessages({ tag: 'all', pinned: true });
+  if (U.filter === 'records') list = getMessages({ tag: 'all', pinned: true, respectRetention: true });
   else if (U.filter === 'mentions') {
     // v0.17.1 — mention inbox removed. If a device has stale state pointing at
     // 'mentions', treat it as 'all' and fix the filter forward.
     U.filter = 'all';
-    list = getMessages({ tag: 'all' });
+    list = getMessages({ tag: 'all', respectRetention: true });
   }
-  else if (U.filter === 'all') list = getMessages({ tag: 'all' });
-  else list = getMessages({ tag: U.filter });
+  else if (U.filter === 'all') list = getMessages({ tag: 'all', respectRetention: true });
+  else list = getMessages({ tag: U.filter, respectRetention: true });
 
   const showSys = getNotifPrefs().systemEvents;
   if (!showSys) list = list.filter(m => m.type !== 'system');
@@ -383,14 +554,18 @@ export function renderChatPage() {
       : 'The Locker Room is open. SCRIBE is on duty.'}</div>`;
   }
 
-  // Header context for game views
+  // Header context for game views — item F: mirrors the dashboard's static
+  // covering/trailing/won/lost colors for the CURRENT viewer's own pick
+  // (blind-rule-safe: your own pick is always visible to you).
   let viewHeader = '';
   if (!['all', 'records'].includes(U.filter)) {
     const found = gameById(U.filter);
     if (found) {
       const g = found.game;
       const score = g.homeScore != null ? `${g.awayScore}–${g.homeScore}` : '';
-      viewHeader = `<div class="chat-view-header">
+      const myViewPick = self ? getPicks(found.week.weekId, self).find(p => p.gameId === g.gameId) : null;
+      const headerCls = gameThreadHeaderClass(myViewPick, g);
+      viewHeader = `<div class="chat-view-header${headerCls}">
         <div><strong>${esc(g.awayTeam)} @ ${esc(g.homeTeam)}</strong>
           <span class="text-muted text-xs">${esc(formatSpread(g.lockedSpread ?? g.spread, g.favorite, g) || '')}</span></div>
         <div>${g.status === GAME_STATUS.LIVE ? `<span class="live-pulse"></span> LIVE ${score}` : score}</div>
@@ -398,8 +573,9 @@ export function renderChatPage() {
     }
   }
 
-  const here = presenceList().filter(p => p.playerId !== self);
-  const presenceLine = `${here.length ? `${here.length + (self ? 1 : 0)} here now · ` : ''}📋 SCRIBE on duty`;
+  // v0.17.2 — the player-presence prefix ("N here now · ") was removed; SCRIBE's
+  // standing "on duty" framing (UN-67) is static copy and stays.
+  const subtitleLine = '📋 SCRIBE on duty';
 
   const banner = st.offline ? `<div class="chat-offline-banner">⚠️ CHAT OFFLINE — ${st.staleDeployment
     ? 'the backend deployment is out of date. Commissioner: open Apps Script → Deploy → Manage deployments → Edit → <b>New version</b>, then reload.'
@@ -407,19 +583,20 @@ export function renderChatPage() {
 
   c.innerHTML = `
     <div class="section-header chat-header-row">
-      <div><h2>Locker Room</h2><div class="subtitle">${esc(presenceLine)}</div></div>
+      <div><h2>Chat</h2><div class="subtitle">${esc(subtitleLine)}</div></div>
       <button class="btn btn-ghost btn-sm" id="chat-prefs-btn" title="Chat preferences">⚙️</button>
     </div>
     ${U.prefsOpen ? prefsPanelHTML() : ''}
     ${banner}
     ${pillsHTML()}
+    ${retentionNoticeHTML()}
     ${viewHeader}
     <div class="chat-scroll" id="chat-scroll">
-      <button class="chat-load-older" id="chat-load-older">↑ load earlier</button>
+      ${retentionOn() ? '' : '<button class="chat-load-older" id="chat-load-older">↑ load earlier</button>'}
       ${msgsHTML}
     </div>
     <button class="chat-jump-latest" id="chat-jump" style="display:none">↓ latest</button>
-    ${self ? composerHTML() : `<div class="chat-login-note">Log in on the Picks tab to join the conversation. Reading is open to the league.</div>`}
+    ${self ? composerHTML() : loginPromptHTML()}
   `;
 
   bindChatPage();
@@ -437,9 +614,65 @@ export function renderChatPage() {
 }
 
 function renderPillsOnly() {
+  _abbrMemo.clear();                                 // per-pass cache only (see abbrMapFor)
   const host = document.querySelector('#page-chat .chat-pills-scroll');
   if (host) host.outerHTML = pillsHTML();
   bindFilterButtons(document.getElementById('page-chat'));
+}
+
+// ── Signed-out composer replacement ───────────────────────────────────────────
+/**
+ * v0.17.2: reading the Locker Room is open to anyone who cleared the site PIN;
+ * posting requires a verified player. Previously this was a dead line of text.
+ * Now it mirrors the dashboard's "Go to Picks" pattern — a real button that
+ * routes to the login screen and comes back here once the player is verified.
+ */
+function loginPromptHTML() {
+  return `
+  <div class="chat-login-prompt">
+    <div class="chat-login-prompt-text">
+      <strong>Log in to post.</strong>
+      <span class="text-muted text-xs">Reading is open to the league — posting needs your PIN.</span>
+    </div>
+    <button class="btn btn-primary btn-sm" id="chat-login-btn">Log in →</button>
+  </div>`;
+}
+
+function bindLoginPrompt(root) {
+  root?.querySelector('#chat-login-btn')?.addEventListener('click', () => {
+    // Remember where they were so login can bounce them back (doc 1.2).
+    U.returnToChat = true;
+    U.returnFilter = U.filter;
+    U.returnAt = Date.now();
+    if (typeof window !== 'undefined' && typeof window.navigateTo === 'function') window.navigateTo('picks');
+    else document.querySelector('.nav-item[data-tab="picks"]')?.click();
+  });
+}
+
+/**
+ * Called after a successful login. If the player was sent to the login screen
+ * from chat, put them back in the same filter they were reading.
+ *
+ * The intent EXPIRES. It used to be cleared only on a successful player-PIN
+ * login, so a reader who tapped "Log in →" and then wandered off left the flag
+ * set for the rest of the session — and their next login, possibly days later,
+ * silently yanked them out of the picks page into chat. "Bounce me back" only
+ * means anything within a few minutes of the tap; after that it is stale intent
+ * and the login should land wherever it normally lands.
+ *
+ * The flag is consumed unconditionally, so it can never go sticky again.
+ */
+const RETURN_WINDOW_MS = 5 * 60 * 1000;
+
+export function resumeChatAfterLogin() {
+  if (!U.returnToChat) return false;
+  const fresh = Date.now() - U.returnAt < RETURN_WINDOW_MS;
+  const filter = U.returnFilter;
+  U.returnToChat = false; U.returnFilter = null; U.returnAt = 0;
+  if (!fresh) return false;
+  if (filter) U.filter = filter;
+  navToChat();
+  return true;
 }
 
 // ── Composer ──────────────────────────────────────────────────────────────────
@@ -451,7 +684,7 @@ function composerHTML() {
   <div class="chat-composer">
     ${replyMsg ? `<div class="chat-replying">↩ replying to <strong>${esc(nameOf(replyMsg.author))}</strong>: ${esc(replyMsg.body.slice(0, 60))}
       <button id="chat-cancel-reply">✕</button></div>` : ''}
-    ${found ? `<div class="chat-tag-chip-row"><span class="chat-tag-chip">🏈 ${esc(gameShort(found.game))}
+    ${found ? `<div class="chat-tag-chip-row"><span class="chat-tag-chip">🏈 ${esc(gameShort(found.game, found.week))}
       <button id="chat-strip-tag" title="Remove game tag — post to the main room only">✕</button></span>
       <span class="text-muted text-xs">tagged — shows in this game's thread and the Locker Room</span></div>` : ''}
     <div class="chat-composer-row">
@@ -460,7 +693,7 @@ function composerHTML() {
       <button class="chat-send-btn" id="chat-send">➤</button>
     </div>
     <div class="chat-composer-foot">
-      <div class="chat-emoji-row">${QUICK_EMOJI.map(e => `<button class="chat-emoji-insert" data-emoji="${e}">${e}</button>`).join('')}</div>
+      <div class="chat-emoji-row">${QUICK_EMOJI.map(e => `<button class="chat-emoji-insert" data-emoji="${e}">${e}</button>`).join('')}<button type="button" class="chat-emoji-insert chat-emoji-more" id="chat-emoji-more" title="More emoji" aria-label="More emoji">➕</button></div>
       <span class="chat-char-count" id="chat-count" style="display:none"></span>
     </div>
     <div class="chat-mention-menu" id="chat-mention-menu" style="display:none"></div>
@@ -529,6 +762,7 @@ function bindFilterButtons(root) {
 function bindChatPage() {
   const c = document.getElementById('page-chat'); if (!c) return;
   bindFilterButtons(c);
+  bindLoginPrompt(c);
 
   document.getElementById('chat-prefs-btn')?.addEventListener('click', () => {
     U.prefsOpen = !U.prefsOpen; renderChatPage();
@@ -612,10 +846,53 @@ function bindChatPage() {
   document.getElementById('chat-send')?.addEventListener('click', doSend);
   document.getElementById('chat-cancel-reply')?.addEventListener('click', () => { U.replyTo = null; renderChatPage(); });
   document.getElementById('chat-strip-tag')?.addEventListener('click', () => { U.tagStripped = true; renderChatPage(); });
-  c.querySelectorAll('.chat-emoji-insert').forEach(b => b.addEventListener('click', () => {
+  c.querySelectorAll('.chat-emoji-insert:not(.chat-emoji-more)').forEach(b => b.addEventListener('click', () => {
     const inp = document.getElementById('chat-input');
     if (inp) { inp.value += b.dataset.emoji; inp.focus(); }
   }));
+  document.getElementById('chat-emoji-more')?.addEventListener('click', e => {
+    e.stopPropagation();
+    const foot = e.currentTarget.closest('.chat-composer-foot');
+    if (foot) toggleChatEmojiPicker(foot);
+  });
+}
+
+/**
+ * Item G — the full REACTION_PALETTE, reachable from the composer via a
+ * "more emoji" button. Reuses `.reaction-picker` / `.reaction-pick-option`
+ * verbatim (same CSS grid app.js's dashboard reaction picker already solved:
+ * 5×3 desktop / 7×3 mobile, 42-44px targets) rather than inventing a second
+ * layout — the v0.15.1 picker shipped at ~22×22px and had to be rebuilt once
+ * already; don't repeat that.
+ *
+ * Built/removed via direct DOM node creation (the SAME pattern as app.js's
+ * `bindReactionHandlers` "+" picker), not a `renderChatPage()` re-render —
+ * a full re-render would wipe any text the player had already typed into the
+ * composer (composerHTML() always starts the textarea empty).
+ */
+function toggleChatEmojiPicker(anchorEl) {
+  const existing = document.getElementById('chat-emoji-picker');
+  if (existing) { existing.remove(); return; }
+  const picker = document.createElement('div');
+  picker.className = 'reaction-picker';
+  picker.id = 'chat-emoji-picker';
+  picker.innerHTML = REACTION_PALETTE.map(em => `<button type="button" class="reaction-pick-option" data-emoji="${esc(em)}">${em}</button>`).join('');
+  anchorEl.appendChild(picker);
+  picker.querySelectorAll('[data-emoji]').forEach(opt => opt.addEventListener('click', ev => {
+    ev.stopPropagation();
+    const inp = document.getElementById('chat-input');
+    if (inp) { inp.value += opt.dataset.emoji; inp.focus(); }
+    picker.remove();
+  }));
+  setTimeout(() => {
+    const closer = ev => {
+      if (!picker.contains(ev.target) && !ev.target.closest?.('#chat-emoji-more')) {
+        picker.remove();
+        document.removeEventListener('click', closer);
+      }
+    };
+    document.addEventListener('click', closer);
+  }, 0);
 }
 
 function maybeMentionMenu(input) {
@@ -662,15 +939,49 @@ function bindPrefsPanel() {
 }
 
 // ── Game-card bubble + bottom sheet ───────────────────────────────────────────
+/**
+ * Item B — three visually distinct states (not just a boolean "has
+ * unread"), and the bubble shows UNREAD count, not the thread's total
+ * message count (the old render used `n`, the total — it lied the moment you
+ * had read even one message).
+ *
+ * Attribution (who the unread is FROM) mirrors the emoji-reaction pattern
+ * (`.reaction-chip`'s `title`) — chosen, deliberately, as OPTION 2 of the
+ * spec's three acceptable answers, not option 1. That pattern IS a bare
+ * `title` attribute, and tooltips do not fire on touch — we hit this exact
+ * gap with the Records pill in batch 2. Reusing it verbatim would ship a
+ * desktop-only affordance while implying it works on a phone. So: `title`
+ * for desktop hover, PLUS the same names in `aria-label` so the information
+ * is available on every device via assistive tech (VoiceOver/TalkBack read
+ * aria-label on focus/tap). Known, documented gap: a SIGHTED touch-only user
+ * still has no *visual* peek at who without opening the thread — tapping the
+ * bubble already does that (its primary action), so the practical cost is
+ * low, but it is real and is not silently papered over here.
+ */
 export function gameChatBubbleHTML(gameId) {
+  if (!isChatEnabled()) return '';
   const self = me();
-  const n = getMessages({ tag: gameId, types: ['message'] }).filter(m => !m.deleted).length;
+  const n = getMessages({ tag: gameId, types: ['message'], respectRetention: true }).filter(m => !m.deleted).length;
   const unread = self ? unreadCount(self, gameId) : 0;
-  return `<button class="chat-bubble-btn${unread ? ' has-unread' : ''}" data-chat-game="${esc(gameId)}" title="Game thread">
-    💬${n ? ` <span class="chat-bubble-count">${n}</span>` : ''}</button>`;
+  const state = unread > 0 ? 'unread' : (n > 0 ? 'read' : 'empty');
+  const countHTML = unread > 0 ? ` <span class="chat-bubble-count">${unread > 99 ? '99+' : unread}</span>` : '';
+  let text;
+  if (unread > 0) {
+    const names = self ? unreadAuthors(self, gameId).map(nameOf) : [];
+    text = names.length
+      ? `${unread} unread from ${names.join(', ')}`
+      : `${unread} unread`;
+  } else if (n > 0) {
+    text = 'Game thread — all caught up';
+  } else {
+    text = 'Game thread — no messages yet';
+  }
+  return `<button type="button" class="chat-bubble-btn chat-bubble-${state}" data-chat-game="${esc(gameId)}"
+    title="${esc(text)}" aria-label="${esc(text)}">💬${countHTML}</button>`;
 }
 
 export function openGameChatSheet(gameId) {
+  if (!isChatEnabled()) { redirectChatDisabled(); return; }
   U.sheetGameId = gameId;
   document.getElementById('chat-sheet-wrap')?.remove();
   const found = gameById(gameId);
@@ -678,11 +989,14 @@ export function openGameChatSheet(gameId) {
   wrap.id = 'chat-sheet-wrap';
   const g = found?.game;
   const score = g && g.homeScore != null ? `${g.awayScore}–${g.homeScore}` : '';
-  const firstUse = !localStorage.getItem('cfbp_chat_sheet_hint');
+  const firstUse = !lsGet('cfbp_chat_sheet_hint');
+  const selfForHeader = me();
+  const myHeaderPick = (selfForHeader && found) ? getPicks(found.week.weekId, selfForHeader).find(p => p.gameId === gameId) : null;
+  const headerCls = gameThreadHeaderClass(myHeaderPick, g);
   wrap.innerHTML = `
     <div class="chat-sheet-backdrop"></div>
     <div class="chat-sheet">
-      <div class="chat-sheet-header">
+      <div class="chat-sheet-header${headerCls}">
         <div><div class="chat-sheet-title">${g ? esc(g.awayTeam) + ' @ ' + esc(g.homeTeam) : 'Game thread'}</div>
           <div class="chat-sheet-sub">${g ? esc(formatSpread(g.lockedSpread ?? g.spread, g.favorite, g) || '') : ''}
             ${g?.status === GAME_STATUS.LIVE ? ` · <span class="live-pulse"></span> LIVE ${score}` : score ? ' · ' + score : ''}</div></div>
@@ -704,7 +1018,7 @@ export function openGameChatSheet(gameId) {
   wrap.querySelector('.chat-sheet-backdrop')?.addEventListener('click', closeSheet);
   document.getElementById('chat-sheet-close')?.addEventListener('click', closeSheet);
   document.getElementById('chat-sheet-hint-ok')?.addEventListener('click', () => {
-    localStorage.setItem('cfbp_chat_sheet_hint', '1');
+    lsSet('cfbp_chat_sheet_hint', '1');
     document.getElementById('chat-sheet-hint')?.remove();
   });
   document.getElementById('chat-sheet-open-main')?.addEventListener('click', () => { closeSheet(); U.filter = gameId; navToChat(); });
@@ -727,10 +1041,13 @@ export function openGameChatSheet(gameId) {
 }
 function closeSheet() { U.sheetGameId = null; document.getElementById('chat-sheet-wrap')?.remove(); }
 function renderSheetMessages() {
+  _abbrMemo.clear();                                 // per-pass cache only (see abbrMapFor)
   const host = document.getElementById('chat-sheet-scroll');
   if (!host || !U.sheetGameId) return;
   const self = me();
-  const list = coalesceStream(getMessages({ tag: U.sheetGameId }));
+  // Retention applies here too — otherwise a player could dodge the window by
+  // opening a game's bottom sheet instead of the main room (UN-8x).
+  const list = coalesceStream(getMessages({ tag: U.sheetGameId, respectRetention: true }));
   host.innerHTML = list.length
     ? list.map(item => item.kind === 'gamereact-run' ? gamereactRunHTML(item) : messageHTML(item, self, false)).join('')
     : '<div class="chat-empty">No entries for this game yet.</div>';
@@ -741,44 +1058,67 @@ function renderSheetMessages() {
   host.querySelectorAll('[data-retry]').forEach(b => b.addEventListener('click', () => { retryFailed(b.dataset.retry); renderSheetMessages(); }));
 }
 
-// ── Dashboard sticky bar ──────────────────────────────────────────────────────
+// ── Dashboard teaser: dismissible + ambient, no quick-reply (items D+E) ──────
+/**
+ * Device-local dismissal (AD-12, widened v0.17.2 — a per-screen UI hint whose
+ * loss costs nothing but a repeat, and whose sync would write-amplify the
+ * Sheet for no shared benefit). Stores the SEQ at dismissal time, not a
+ * boolean, so "genuinely new activity since dismissal" is a plain number
+ * comparison — the teaser reappears once a message with a HIGHER seq than
+ * this exists, and stays gone otherwise, including across reloads.
+ */
+const TEASER_DISMISS_KEY = 'cfbp_chat_teaser_dismiss_seq';
+function teaserDismissedSeq() {
+  const n = Number(lsGet(TEASER_DISMISS_KEY));
+  return Number.isFinite(n) ? n : -1;   // -1 = never dismissed
+}
+function setTeaserDismissedSeq(seq) {
+  lsSet(TEASER_DISMISS_KEY, String(Number(seq) || 0));
+}
+
+/**
+ * Item D+E — read-only ambient indicator, no quick-reply input (E), and
+ * dismissible (D). Tapping the card body opens chat (data-open-chat);
+ * tapping the ✕ dismisses it — two DIFFERENT gestures, not the whole card
+ * doing double duty as both, which would be ambiguous about what a tap does.
+ *
+ * States:
+ *  - chat disabled (item A): not rendered.
+ *  - zero messages ever (no notifying message exists): not rendered — no
+ *    empty card taking up dashboard space.
+ *  - dismissed, no new activity since (latest notifying seq <= dismissed
+ *    seq): not rendered.
+ *  - new activity since dismissal: rendered.
+ */
 export function dashboardChatTeaserHTML() {
+  if (!isChatEnabled()) return '';
   const self = me();
-  const n = self ? unreadCount(self, 'all') : 0;
   const latest = latestNotifying(self);
-  const preview = latest ? `<strong>${esc(nameOf(latest.author))}</strong>: ${esc(latest.body.slice(0, 64))}` : 'The Locker Room is open.';
+  if (!latest) return '';                                    // zero messages ever
+  const latestSeq = typeof latest.seq === 'number' ? latest.seq : 0;
+  if (latestSeq <= teaserDismissedSeq()) return '';           // dismissed, nothing new since
+  const n = self ? unreadCount(self, 'all') : 0;
+  const preview = `<strong>${esc(nameOf(latest.author))}</strong>: ${esc(latest.body.slice(0, 64))}`;
   return `
-  <div class="card mb-md dash-chat-teaser" id="dash-chat-teaser">
+  <div class="card mb-md dash-chat-teaser" id="dash-chat-teaser" data-teaser-seq="${latestSeq}">
     <div class="dash-chat-left" data-open-chat>
       <span class="dash-chat-icon">💬</span>
-      <div>
-        <div class="dash-chat-title">Locker Room ${n ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : ''}</div>
+      <div class="dash-chat-body">
+        <div class="dash-chat-title">Chat ${n ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : ''}</div>
         <div class="dash-chat-preview">${preview}</div>
       </div>
     </div>
-    ${self ? `<div class="dash-chat-quick">
-      <input class="form-input dash-chat-input" id="dash-quick-input" maxlength="1000" placeholder="Quick reply…" />
-      <button class="btn btn-primary btn-sm" id="dash-quick-send">➤</button>
-    </div>` : ''}
+    <button type="button" class="dash-chat-dismiss" id="dash-chat-dismiss" title="Dismiss" aria-label="Dismiss chat preview">✕</button>
   </div>`;
 }
 
 function bindDashboardTeaser() {
-  const send = () => {
-    const inp = document.getElementById('dash-quick-input');
-    const body = (inp?.value || '').trim();
-    const self = me();
-    if (!body || !self) return;
-    sendMessage({ body, gameTag: '', author: self, mentions: extractMentions(body) });
-    if (inp) { inp.value = ''; inp.placeholder = 'Sent ✓'; setTimeout(() => { inp.placeholder = 'Quick reply…'; }, 1500); }
-    updateChatBadges();
-  };
-  document.getElementById('dash-quick-send')?.addEventListener('click', e => { e.stopPropagation(); send(); });
-  document.getElementById('dash-quick-input')?.addEventListener('keydown', e => {
+  document.getElementById('dash-chat-dismiss')?.addEventListener('click', e => {
     e.stopPropagation();
-    if (e.key === 'Enter') { e.preventDefault(); send(); }
+    const card = document.getElementById('dash-chat-teaser');
+    setTeaserDismissedSeq(card?.dataset.teaserSeq);
+    card?.remove();
   });
-  document.getElementById('dash-quick-input')?.addEventListener('click', e => e.stopPropagation());
 }
 
 // ── Legacy alias (app.js compatibility) ───────────────────────────────────────
@@ -808,19 +1148,27 @@ export function emitPickRevealEvent(week) {
   const games = getGames(week.weekId).sort((a, b) => new Date(a.kickoff) - new Date(b.kickoff));
   if (!games.length) return;
   const players = getPlayers().filter(p => p.active);
+  // Shorthand for the reveal grid comes from the shared table, built over THIS
+  // slate so the dedup pass guarantees no two teams in the grid collapse to the
+  // same cell. This event is written once under a deterministic id into an
+  // append-only log — whatever text it carries is permanent, so an ambiguous
+  // abbreviation here could never be corrected. The retired
+  // `selectedTeam.split(' ').pop()` heuristic rendered both "Arkansas State"
+  // and "Ohio State" as "State", making the row unreadable.
+  const revealAbbr = buildAbbrMap(games);
   const lines = players.map(p => {
     const picks = getPicks(week.weekId, p.playerId);
-    if (!picks.length) return `${nameOf(p.playerId)} — no orders on file`;
+    if (!picks.length) return `${nameOf(p.playerId)} — no picks on file`;
     const parts = games.map(g => {
       const pk = picks.find(x => x.gameId === g.gameId);
-      return pk ? pk.selectedTeam.split(' ').pop() : '—';
+      return pk ? (revealAbbr.get(pk.selectedTeam) || pk.selectedTeam) : '—';
     });
     return `${nameOf(p.playerId)}: ${parts.join(' · ')}`;
   });
   sendEvent({
     id: `sys_reveal_${week.weekId}`, type: 'system', author: 'system', notify: true,
     body: lines.join('\n'),
-    meta: { kind: 'reveal', weekId: week.weekId, title: `${formatWeekLabel(week)} — the orders are in` },
+    meta: { kind: 'reveal', weekId: week.weekId, title: `${formatWeekLabel(week)} — the picks are in` },
   });
   showToast({ author: 'system', body: `🔓 ${formatWeekLabel(week)} picks revealed` }, { force: true });
 }
@@ -934,12 +1282,12 @@ function maybeAnniversary() {
   try {
     const key = 'cfbp_scribe_anniv';
     const today = new Date().toISOString().slice(0, 10);
-    if (localStorage.getItem(key) === today) return;
+    if (lsGet(key) === today) return;
     const target = Date.now() - 365 * 86400000;
     const hit = getMessages({ tag: 'all', types: ['message'] })
       .filter(m => !m.deleted && m.author !== 'system' && Math.abs((m.ts || 0) - target) < 12 * 3600000)
       .sort((a, b) => Object.values(b.reactions || {}).flat().length - Object.values(a.reactions || {}).flat().length)[0];
-    localStorage.setItem(key, today);
+    lsSet(key, today);
     if (hit) scribeTrigger('anniversary', {
       subject: hit.id, quote: { id: hit.id, author: hit.author, body: hit.body.slice(0, 160) },
     });
@@ -961,13 +1309,25 @@ export function initChatUI() {
       }
       if (chatPageActive()) renderChatPage();
       if (U.sheetGameId) renderSheetMessages();
-      const teaser = document.getElementById('dash-chat-teaser');
-      if (teaser && !document.getElementById('dash-quick-input')?.matches(':focus')) {
-        teaser.outerHTML = dashboardChatTeaserHTML();
-        bindDashboardTeaser();
+      // Live-sync the teaser while the dashboard is on screen: update it if
+      // present, insert it if new activity just made it eligible again (e.g.
+      // a message arrived with a higher seq than the dismissed one), and
+      // remove it if it's no longer eligible (item D — "reappears only for
+      // genuinely new activity").
+      if (dashboardPageActive()) {
+        const teaser = document.getElementById('dash-chat-teaser');
+        const freshHTML = dashboardChatTeaserHTML();
+        if (teaser) {
+          if (freshHTML) { teaser.outerHTML = freshHTML; bindDashboardTeaser(); }
+          else teaser.remove();
+        } else if (freshHTML) {
+          const host = document.getElementById('page-dashboard');
+          host?.insertAdjacentHTML('afterbegin', freshHTML);
+          bindDashboardTeaser();
+        }
       }
     }
-    if (kind === 'offline' || kind === 'online' || kind === 'presence') {
+    if (kind === 'offline' || kind === 'online') {
       if (chatPageActive()) renderChatPage();
     }
   });
@@ -980,10 +1340,13 @@ export function initChatUI() {
     if (openChat) { e.preventDefault(); navToChat(); }
   });
 
-  // Rebind the teaser whenever the dashboard renders it
+  // Rebind the teaser's dismiss control whenever the dashboard re-renders it
+  // (renderDashboard() replaces #page-dashboard's innerHTML wholesale, which
+  // wipes any listeners bound to the previous instance of the card).
   const rebind = new MutationObserver(() => {
-    if (document.getElementById('dash-quick-input') && !document.getElementById('dash-quick-input')._bound) {
-      document.getElementById('dash-quick-input')._bound = true;
+    const dismissBtn = document.getElementById('dash-chat-dismiss');
+    if (dismissBtn && !dismissBtn._bound) {
+      dismissBtn._bound = true;
       bindDashboardTeaser();
     }
   });

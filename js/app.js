@@ -4,8 +4,8 @@
  * One-stop place to update the user-visible version string + release date.
  * Surfaced in the footer of the Rules tab (Priority 12).
  */
-export const APP_VERSION = 'v0.17.1';
-export const APP_VERSION_DATE = '2026-08-06';
+export const APP_VERSION = 'v0.17.3';
+export const APP_VERSION_DATE = '2026-08-07';
 
 
 import {
@@ -15,10 +15,12 @@ import {
   formatGameTime, formatVenueDisplay, formatSpread, getPlayerInitials,
   sourceModeLabelOf, ALMA_MATER_DISPLAY, getAlmaMaterMatch,
   formatTeamName, getTeamDisplay, gameDataReadiness,
+  buildAbbrMap, REACTION_PALETTE,
   THEMES,
   HISTORICAL_DEMO_WEEK, HISTORICAL_DEMO_GAMES, REAL_WEEK_1_2026,
   SITE_PIN,
   getAutoLockOffsetMinutes, getAutoLiveEnabled, getAutoFinalizeEnabled,
+  obligationRole, obligationNextStatus, obligationStatusDisplay,
 } from './data-model.js';
 
 import {
@@ -84,10 +86,11 @@ import {
   updateChatBadges, openGameChatSheet, setChatChannel,
   emitPicksLockedEvent, emitGameFinalEvent, emitExtraPointEvent, emitWeekFinalEvent,
   emitPickRevealEvent, emitKickoffEvent, scribeLiveGameCheck,
+  resumeChatAfterLogin,
   chatDigest,
 } from './chat-ui.js';
-import { setPollMode, sendEvent as sendChatEvent, sendGameReact } from './chat.js';
-import { SEASON_2025, season2025Obligations, season2025Nets } from './history-2025.js';
+import { setPollMode, sendEvent as sendChatEvent, sendGameReact, getRetentionDays, retentionStats, isChatEnabled, refreshChatEnabled } from './chat.js';
+import { SEASON_2025, season2025Obligations, season2025Nets, ob2025Status } from './history-2025.js';
 import { fetchMetrics as fetchChatMetrics } from './chatTransport.js';
 import { renderPicksFooterHTML, renderWeekRecapCardHTML } from './recap.js';
 import {
@@ -151,6 +154,10 @@ async function boot() {
   }
 
   setupNav(); refreshHeader(); renderTzToggle(); renderThemeToggle(); applyTheme(getTheme()); setupAutoRefresh();
+  // Item A — independent of the score auto-refresh interval (which the
+  // commissioner can set to "Off"), so the mid-session chat-off watch always
+  // runs regardless of that other setting.
+  setupChatEnabledWatch();
   if (!getSettings().dashboardLayout && typeof window !== 'undefined' && window.innerWidth && window.innerWidth < 600) {
     saveSetting('dashboardLayout', 'compact');
   }
@@ -290,13 +297,52 @@ function checkPickRevealDue() {
   try { localStorage.setItem(key, JSON.stringify(done.slice(-20))); } catch {}
 }
 
+// ── Item A: commissioner chat on/off toggle — nav + live watch ───────────────
+/** Shows/hides the bottom-nav Chat entry. `.nav-item` is `flex:1` in a `flex`
+ *  row (css/styles.css), so `display:none` on one item redistributes the
+ *  remaining five evenly — no gap, no misalignment (verified against the
+ *  actual CSS rule, not assumed). */
+function applyChatNavVisibility() {
+  const enabled = isChatEnabled();
+  document.querySelectorAll('.nav-item[data-tab="chat"]').forEach(el => { el.style.display = enabled ? '' : 'none'; });
+}
+
+/** Periodic mid-session watch (item A hazard #1's second half): a player
+ *  sitting ON the chat page when the setting flips off must not be stranded.
+ *  Runs independently of the score auto-refresh interval (which the
+ *  commissioner can set to "Off") so this check keeps working even then. */
+function checkChatEnabledLive() {
+  applyChatNavVisibility();
+  try { refreshChatEnabled(); } catch {}
+  if (!isChatEnabled() && state.currentTab === 'chat') {
+    showToast('Chat has been turned off by the commissioner.', 'warning');
+    navigateTo('dashboard');
+  }
+}
+
+let _chatEnabledWatchTimer = null;
+function setupChatEnabledWatch() {
+  if (_chatEnabledWatchTimer) clearInterval(_chatEnabledWatchTimer);
+  _chatEnabledWatchTimer = setInterval(() => { try { checkChatEnabledLive(); } catch {} }, 20000);
+}
+
 function navigateTo(tab) {
+  // Item A — chat OFF must never be reachable via navigation. Redirect BEFORE
+  // touching any page/nav state so the chat page is never even briefly the
+  // active section. (renderChatPage() carries the SAME guard as defense in
+  // depth for callers that reach it some other way.)
+  if (tab === 'chat' && !isChatEnabled()) {
+    showToast('Chat has been turned off by the commissioner.', 'warning');
+    tab = 'dashboard';
+  }
   state.currentTab = tab;
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.querySelectorAll('.page-section').forEach(el => el.classList.toggle('active', el.id === `page-${tab}`));
+  applyChatNavVisibility();
   ({ picks: renderPicksPage, dashboard: renderDashboard, leaderboard: renderLeaderboard, commissioner: renderCommPage, rules: renderRulesPage, chat: renderChatPage })[tab]?.();
   // Chat polls fast only while the chat tab is open
   try { setPollMode(tab === 'chat' ? 'active' : 'passive'); updateChatBadges(); } catch {}
+  try { refreshChatEnabled(); } catch {}
   try { checkPickRevealDue(); } catch {}
 }
 
@@ -654,8 +700,12 @@ function renderTiebreakerInput(week) {
 
 function renderLoginScreen(week) {
   const players = getPlayers().filter(p => p.active);
+  // v0.17.2: the lock deadline is the single best reason to sign in, so it sits
+  // above the player grid rather than behind the PIN.
+  const games = week ? getGames(week.weekId) : [];
   return `
     ${renderWeekBanner(week)}
+    ${renderLockCountdownHTML(week, games)}
     <div class="card">
       <div class="card-header"><span class="card-title">👤 Who Are You?</span></div>
       <p class="text-secondary text-sm mb-md">Select your name and enter your PIN.</p>
@@ -710,6 +760,9 @@ function bindLoginScreen() {
       // player (they may differ from device default or previous player).
       resyncPlayerPreferences();
       showToast('✅ Logged in!','success'); renderPicksPage();
+      // v0.17.2: if they came here from the chat composer's "Log in" button,
+      // bounce them back to the thread they were reading (doc 1.2).
+      try { resumeChatAfterLogin(); } catch {}
     } else {
       showToast('❌ Incorrect PIN','error');
       const pi=document.getElementById('pin-input'); if(pi){pi.value='';pi.focus();}
@@ -793,6 +846,58 @@ function renderPicksTiming(week, games) {
   return `<div class="picks-timing-info mb-md">
     <span class="pt-item ${lockPassed?'pt-passed':''}">🔒 <strong>Picks lock:</strong> ${escHtml(fmt(lockAt))}${isLocked?' <em>(locked)</em>':''}</span>
     <span class="pt-item ${livePassed?'pt-passed':''}">🏈 <strong>Games live:</strong> ${escHtml(fmt(liveAt))}</span>
+  </div>`;
+}
+
+/**
+ * Human "time remaining" for a deadline, e.g. "2d 4h", "3h 12m", "8m".
+ * Returns '' once the deadline has passed — callers show a locked state instead.
+ */
+function timeUntil(target) {
+  if (!target) return '';
+  const ms = target.getTime() - Date.now();
+  if (ms <= 0) return '';
+  const mins = Math.floor(ms / 60000);
+  const d = Math.floor(mins / 1440);
+  const h = Math.floor((mins % 1440) / 60);
+  const m = mins % 60;
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+/**
+ * Prominent lock countdown, shown to EVERYONE including signed-out visitors.
+ *
+ * v0.17.2 (Drew): the auto-lock deadline was only reachable after login, which
+ * is backwards — the deadline is the reason to log in. This renders on the
+ * picks login screen and on the dashboard's "Go to Picks" prompt.
+ *
+ * Deliberately contains NO pick data, so it is safe on a signed-out surface
+ * and cannot violate the blind rule.
+ */
+function renderLockCountdownHTML(week, games, { compact = false } = {}) {
+  if (!week || !games?.length) return '';
+  if (week.status === WEEK_STATUS.LIVE || week.status === WEEK_STATUS.FINAL) return '';
+  const lockAt = computeEffectiveLockAt(week, games);
+  if (!lockAt) return '';
+  const tz = getTimezone();
+  const when = formatGameTime(lockAt.toISOString(), tz);
+  const left = timeUntil(lockAt);
+  const locked = week.status === WEEK_STATUS.LOCKED || !left;
+
+  if (locked) {
+    return `<div class="lock-countdown lock-countdown-closed${compact ? ' lock-countdown-compact' : ''}">
+      <span class="lock-countdown-icon">🔒</span>
+      <div><div class="lock-countdown-main">Picks are locked</div>
+      <div class="lock-countdown-sub">Locked ${escHtml(when)}</div></div>
+    </div>`;
+  }
+  const urgent = lockAt.getTime() - Date.now() < 3 * 3600 * 1000;
+  return `<div class="lock-countdown${urgent ? ' lock-countdown-urgent' : ''}${compact ? ' lock-countdown-compact' : ''}">
+    <span class="lock-countdown-icon">⏳</span>
+    <div><div class="lock-countdown-main">Picks lock in ${escHtml(left)}</div>
+    <div class="lock-countdown-sub">${escHtml(when)} · ${games.length} game${games.length === 1 ? '' : 's'} on the slate</div></div>
   </div>`;
 }
 
@@ -1429,14 +1534,20 @@ function renderDashboardTable(players,games,allPicks,weeklyResults,weekId,actual
 
   // If not public, not admin, and player hasn't submitted — show prompt not data
   if (!isPublic && !session.isAdmin) {
+    // v0.17.2 (Drew): surface the lock deadline here too — this prompt is where
+    // a signed-out viewer lands, so it's the highest-leverage place to show what
+    // they're about to miss. Contains no pick data; blind rule is unaffected.
+    const countdown = renderLockCountdownHTML(week, games, { compact: true });
     if (!session.playerVerified) {
       return `<div class="text-center" style="padding:24px">
+        ${countdown}
         <p class="text-muted text-sm mb-md">Log in and submit your picks to view the pick matrix.</p>
         <button class="btn btn-primary btn-sm" onclick="navigateTo('picks')">Go to Picks</button>
       </div>`;
     }
     if (!hasPlayerSubmitted(weekId, session.playerId)) {
       return `<div class="text-center" style="padding:24px">
+        ${countdown}
         <p class="text-muted text-sm mb-md">Submit your picks first — keeps it blind until you're in.</p>
         <button class="btn btn-primary btn-sm" onclick="navigateTo('picks')">Submit My Picks</button>
       </div>`;
@@ -1539,14 +1650,11 @@ function renderDashboardTable(players,games,allPicks,weeklyResults,weekId,actual
 // in Sheets mode); UI is a small strip of chips per game with a "+" picker.
 // Only logged-in players can react. Tapping the same emoji removes the vote.
 
-// Reaction palette — expanded set (Priority 9). Order chosen to keep the most
-// commonly-used emojis (thumbs up/down, fire, laugh) early so they're easy to
-// hit without scrolling on mobile. The picker UI wraps when the palette is
-// wider than the popover, so adding more is safe.
-const REACTION_PALETTE = [
-  '👍','👎','🔥','😂','😁','😭','😅','😬','🤡',
-  '🫡','🤘','🤙','☝️','🚀','🖕',
-];
+// Reaction palette — item G (batch 3+4): moved to data-model.js as the ONE
+// shared emoji source for the whole app (AD-20 extended). chat-ui.js's
+// composer picker pulls from the SAME list, so the two surfaces can never
+// drift apart the way TEAM_ABBR once did (RG-13). Do not reintroduce a local
+// literal here — import REACTION_PALETTE from data-model.js instead.
 
 /**
  * Render the reactions strip for one game. Returns a span with chips for each
@@ -1981,15 +2089,11 @@ function renderLeaderboard() {
               <td class="player-name-cell">${winner?escHtml(winner.displayName):'—'}${winner?.wonByTiebreaker?' (TB)':''}</td>
               <td class="player-name-cell">${loser?escHtml(loser.displayName):'—'}</td>
               <td>
-                ${ob?(()=>{
-                  const sess = getSession();
-                  // Permission to mark paid: commissioner, OR the player who
-                  // actually owes the obligation (payerPlayerId). Receiving
-                  // players + bystanders can see the status but not change it.
-                  const canMark = sess.isAdmin || sess.playerId === ob.payerPlayerId;
-                  return `<span class="badge ${ob.status==='paid'?'badge-open':ob.status==='waived'?'badge-final':'badge-locked'}">${ob.status}</span>
-                  ${ob.status!=='paid' && canMark ? `<button class="btn btn-win btn-sm ml-sm mark-paid-standings-btn" data-ob-id="${ob.obligationId}">Mark Paid</button>` : ''}`;
-                })():'<span class="text-muted text-xs">—</span>'}
+                ${ob ? obligationActionsHTML(ob.status, ob, getSession(), {
+                    payerName: getPlayer(ob.payerPlayerId)?.displayName || '?',
+                    recipientName: getPlayer(ob.recipientPlayerId)?.displayName || '?',
+                    obClass: 'ob-action',
+                  }) : '<span class="text-muted text-xs">—</span>'}
               </td>
             </tr>`;
           }).join('')}
@@ -2002,18 +2106,10 @@ function renderLeaderboard() {
   `;
 
   bindSeason2025Sections(c);
-  c.querySelectorAll('.mark-paid-standings-btn').forEach(btn=>{
+  c.querySelectorAll('.ob-action-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
-      const ob=getObligations().find(o=>o.obligationId===btn.dataset.obId); if(!ob)return;
-      // Re-check permission server-side — UI hides the button but a sufficiently
-      // motivated person could DOM it in. Reject if neither admin nor payer.
-      const sess = getSession();
-      if (!sess.isAdmin && sess.playerId !== ob.payerPlayerId) {
-        showToast('Only the commissioner or the person who owes can mark this paid','error');
-        return;
-      }
-      saveObligation({...ob,status:'paid',paidAt:new Date().toISOString()});
-      showToast('Marked paid ✅','success'); renderLeaderboard();
+      handleObligationAction(btn.dataset.obId, btn.dataset.obAction);
+      renderLeaderboard();
     });
   });
 }
@@ -2715,6 +2811,13 @@ function renderCommPage() {
             </div>
           </div>
         </div>
+      </div>`);
+
+    // Chat retention (UN-8x) — directly below Data Management, same tab (RG-10).
+    sections.push(`
+      <div class="admin-section" data-comm-tab="data">
+        <div class="admin-section-title">🙈 Chat Retention</div>
+        <div class="card">${renderChatRetentionAdmin()}</div>
       </div>`);
 
     c.innerHTML = sections.join('\n');
@@ -3821,37 +3924,35 @@ function bindCommEventListeners(week, games, availGames, suggested, settings, al
       showToast('🗑 Obligation deleted','success'); renderCommPage();
     });
   });
-  document.querySelectorAll('.mark-unpaid-btn').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      const ob=getObligations().find(o=>o.obligationId===btn.dataset.obId); if(!ob)return;
-      saveObligation({...ob,status:'unpaid',paidAt:null});
-      renderCommPage();
-    });
-  });
   document.getElementById('ob-purge-demo')?.addEventListener('click',()=>{
     const demoIds=new Set(getWeeks().filter(w=>w.dataSourceMode==='demo').map(w=>w.weekId));
     saveAllObligations(getObligations().filter(o=>!demoIds.has(o.weekId)));
     showToast('🧹 Demo obligations purged','success'); renderCommPage();
   });
-  document.querySelectorAll('.ob2025-toggle').forEach(btn=>{
+  // UN-8x debt-payment approval — one delegate per ledger shape, both driving
+  // the SAME state-machine helpers the Standings page uses (obligationRole /
+  // obligationNextStatus in data-model.js), so the comm panel and Standings
+  // can never disagree about a transition.
+  document.querySelectorAll('.ob-action-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
-      const map={...(getSettings().ob2025||{})};
-      map[btn.dataset.obId]=!map[btn.dataset.obId];
-      saveSetting('ob2025',map);
+      handleObligationAction(btn.dataset.obId, btn.dataset.obAction);
       renderCommPage();
     });
   });
-  document.querySelectorAll('.mark-paid-btn').forEach(btn=>{
+  document.querySelectorAll('.ob2025-action-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
-      const ob=getObligations().find(o=>o.obligationId===btn.dataset.obId); if(!ob)return;
-      const sess = getSession();
-      if (!sess.isAdmin && sess.playerId !== ob.payerPlayerId) {
-        showToast('Only the commissioner or the person who owes can mark this paid','error');
-        return;
-      }
-      saveObligation({...ob,status:'paid',paidAt:new Date().toISOString()});
-      showToast('Marked paid ✅','success'); renderCommPage();
+      handleOb2025Action(btn.dataset.obId, btn.dataset.obAction);
+      renderCommPage();
     });
+  });
+
+  // Chat retention (UN-8x) — synced setting, OFF by default (CONVENTIONS #10).
+  document.getElementById('chat-retention-toggle')?.addEventListener('change', e => {
+    saveSetting('chatRetentionDays', e.target.checked ? 7 : 0);
+    showToast(e.target.checked
+      ? '🙈 Chat retention on — messages older than 7 days will stop showing'
+      : 'Chat retention off — full history restored', 'success');
+    renderCommPage();
   });
 
   // Auto-refresh
@@ -4200,13 +4301,130 @@ function currentSeasonObligations() {
   return getObligations().filter(o=>!demoIds.has(o.weekId) && !String(o.obligationId).startsWith('ob_2025_'));
 }
 
+// ─── DEBT-PAYMENT APPROVAL (UN-8x) ─────────────────────────────────────────
+// Badge + action markup shared by EVERY render path that shows an
+// obligation's payment status: the Standings weekly-history cell, the comm
+// Players-tab Obligations card, and both the current-season and 2K25-
+// carryover variants of each. One function so all five surfaces can never
+// disagree about copy, badge color, or which button a given viewer sees
+// (CONVENTIONS #21 — this is the codebase's most common defect class).
+//
+//   status   — 'unpaid' | 'pending' | 'paid' | 'waived'
+//   ob       — anything carrying payerPlayerId/recipientPlayerId/obligationId;
+//              works unmodified for both a real cfbp_obligations record and a
+//              synthetic season2025Obligations() row
+//   sess     — getSession() shape ({isAdmin, playerId, ...})
+//   obClass  — CSS class prefix on the action buttons (and the data-ob-action
+//              attribute) so the click delegate knows which store to mutate:
+//              'ob-action' → current-season (saveObligation); 'ob2025-action'
+//              → the settings.ob2025 status-map overlay
+function obligationActionsHTML(status, ob, sess, { payerName, recipientName, obClass }) {
+  const role = obligationRole(sess, ob);
+  const disp = obligationStatusDisplay(status);
+  let title = '';
+  if (status === 'pending') title = `Pending confirmation from ${recipientName} or the commissioner`;
+  else if (status === 'unpaid' && ob.deniedReason) title = `Denied: ${ob.deniedReason}`;
+  const badge = `<span class="badge ${disp.badgeClass}"${title ? ` title="${escHtml(title)}"` : ''}>${escHtml(disp.label)}</span>`;
+
+  const btn = (action, label, cls = 'btn-win') =>
+    `<button class="btn ${cls} btn-sm ml-sm ${obClass}-btn" data-ob-id="${escHtml(ob.obligationId)}" data-ob-action="${action}">${escHtml(label)}</button>`;
+
+  let actions = '';
+  if (status === 'unpaid') {
+    // Payer's own claim needs confirmation (→ pending); the creditor's or the
+    // commissioner's own action IS the verification (→ paid, direct).
+    if (role === 'payer') actions = btn('mark', 'Mark Paid');
+    else if (role === 'creditor') actions = btn('mark', 'Confirm Paid');
+    else if (role === 'admin') actions = btn('mark', 'Mark Paid');
+  } else if (status === 'pending') {
+    if (role === 'payer') actions = `<span class="text-muted text-xs ml-sm">Waiting on ${escHtml(recipientName)} to confirm.</span>`;
+    else if (role === 'creditor' || role === 'admin') actions = btn('confirm', 'Confirm') + btn('deny', 'Deny', 'btn-danger');
+  } else if (status === 'paid' && role === 'admin') {
+    actions = `<button class="btn btn-ghost btn-sm ml-sm ${obClass}-btn" data-ob-id="${escHtml(ob.obligationId)}" data-ob-action="undo">Undo</button>`;
+  }
+  // waived, and every other (status, role) combo (payer/creditor/bystander on
+  // paid; bystander everywhere): badge only — no button rendered.
+  return badge + actions;
+}
+
+/** Applies one UN-8x transition to a CURRENT-SEASON obligation (a full
+ *  cfbp_obligations record). Re-derives role + the legal next status from the
+ *  store rather than trusting the caller — the UI hides buttons a viewer
+ *  shouldn't see, but a sufficiently motivated person could DOM one in, and
+ *  this is the actual permission boundary (existing pattern in this file). */
+function handleObligationAction(obId, action) {
+  const ob = getObligations().find(o => o.obligationId === obId); if (!ob) return;
+  const sess = getSession();
+  const role = obligationRole(sess, ob);
+  const next = obligationNextStatus(ob.status, role, action);
+  if (!next) { showToast("You don't have permission to do that", 'error'); return; }
+  const payerName = getPlayer(ob.payerPlayerId)?.displayName || '?';
+  const recipientName = getPlayer(ob.recipientPlayerId)?.displayName || '?';
+
+  if (action === 'deny') {
+    const reason = prompt('Why are you denying this? (optional — leave blank to skip)');
+    if (reason === null) return;                          // cancelled the prompt — no change
+    saveObligation({ ...ob, status: next, deniedReason: reason.trim() || null, paidAt: null });
+    showToast('Denied — back to unpaid.', 'error');
+  } else if (action === 'mark' && next === 'pending') {
+    saveObligation({ ...ob, status: next, deniedReason: null });
+    showToast(`Marked as paid — waiting on ${escHtml(recipientName)} or the commissioner to confirm.`, 'warning');
+  } else if (action === 'mark' && next === 'paid') {
+    saveObligation({ ...ob, status: next, paidAt: new Date().toISOString(), deniedReason: null });
+    showToast(role === 'creditor' ? 'Confirmed — marked paid.' : 'Marked paid ✅', 'success');
+  } else if (action === 'confirm') {
+    saveObligation({ ...ob, status: next, paidAt: new Date().toISOString(), deniedReason: null });
+    showToast(`Confirmed — ${escHtml(payerName)} paid ${escHtml(recipientName)}.`, 'success');
+  } else if (action === 'undo') {
+    saveObligation({ ...ob, status: next, paidAt: null });
+  }
+}
+
+/** Same transitions, applied to the 2K25 CARRYOVER ledger — a status-map
+ *  overlay (settings.ob2025) on baked history, not a stored record. See
+ *  history-2025.js `ob2025Status()` for the legacy-boolean migration story.
+ *  No denial-reason prompt: the map's value shape is intentionally a bare
+ *  status string ('pending'|'paid', absence=unpaid) with nowhere to carry an
+ *  optional reason, so unlike the current-season ledger, deny here does not
+ *  ask for one. */
+function handleOb2025Action(obligationId, action) {
+  const row = season2025Obligations().find(r => r.obligationId === obligationId); if (!row) return;
+  const sess = getSession();
+  const role = obligationRole(sess, row);
+  const status = ob2025Status(getSettings().ob2025 || {}, obligationId);
+  const next = obligationNextStatus(status, role, action);
+  if (!next) { showToast("You don't have permission to do that", 'error'); return; }
+  const applyStatus = (s) => {
+    const map = { ...(getSettings().ob2025 || {}) };
+    if (s === 'unpaid') delete map[obligationId]; else map[obligationId] = s;
+    saveSetting('ob2025', map);
+  };
+  if (action === 'deny') {
+    applyStatus(next);
+    showToast('Denied — back to unpaid.', 'error');
+  } else if (action === 'mark' && next === 'pending') {
+    applyStatus(next);
+    showToast(`Marked as paid — waiting on ${escHtml(row.recipientName)} or the commissioner to confirm.`, 'warning');
+  } else if (action === 'mark' && next === 'paid') {
+    applyStatus(next);
+    showToast(role === 'creditor' ? 'Confirmed — marked paid.' : 'Marked paid ✅', 'success');
+  } else if (action === 'confirm') {
+    applyStatus(next);
+    showToast(`Confirmed — ${escHtml(row.payerName)} paid ${escHtml(row.recipientName)}.`, 'success');
+  } else if (action === 'undo') {
+    applyStatus(next);
+  }
+}
+
 /** v0.17.0 — 2K25 outstanding balances, visible to the whole league on the
  *  Standings tab. Paid-state syncs via settings.ob2025 (commissioner or the
  *  payer can mark). Collapsible so the current season stays front and center. */
 function renderSeason2025OutstandingSection() {
   const paidMap = getSettings().ob2025 || {};
   const rows = season2025Obligations();
-  const openRowsAll = rows.filter(r => !paidMap[r.obligationId]);
+  // "Open" = anything not fully PAID — pending rows still owe the money, so
+  // they stay counted, filtered, and rendered right alongside unpaid ones.
+  const openRowsAll = rows.filter(r => ob2025Status(paidMap, r.obligationId) !== 'paid');
   const nets = season2025Nets();
   const fmtNet = n => n > 0 ? `+${n}` : `${n}`;
   const sess = getSession();
@@ -4229,7 +4447,7 @@ function renderSeason2025OutstandingSection() {
   return `
     <div class="admin-section-title">🍺 2K25 Outstanding Balances</div>
     <div class="card mb-md">
-      <p class="text-muted text-xs mb-sm">${openRowsAll.length} of ${rows.length} drinks from last season remain unpaid. Per league bylaw: settled IN PERSON only. Net position: ${Object.entries(nets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`${escHtml(n)} ${fmtNet(v)}`).join(' · ')}.</p>
+      <p class="text-muted text-xs mb-sm">${openRowsAll.length} of ${rows.length} drinks from last season remain outstanding. Per league bylaw: settled IN PERSON only. Net position: ${Object.entries(nets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`${escHtml(n)} ${fmtNet(v)}`).join(' · ')}.</p>
       ${showFilter ? `
         <div class="ob-filter-tabs mb-sm">
           <button type="button" class="ob-filter-tab${filter==='all'?' active':''}" data-ob-filter="all">All (${openRowsAll.length})</button>
@@ -4239,11 +4457,11 @@ function renderSeason2025OutstandingSection() {
         </div>
       ` : ''}
       ${openRows.length ? openRows.map(r => {
-        const canMark = sess.isAdmin || sess.playerId === r.payerPlayerId;
+        const status = ob2025Status(paidMap, r.obligationId);
         return `<div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border)">
           <div class="text-sm"><strong>${escHtml(r.payerName)}</strong> owes <strong>${escHtml(r.recipientName)}</strong> — ${escHtml(r.prize)}
             <span class="text-xs text-muted">(${escHtml(r.weekLabel)})</span></div>
-          ${canMark ? `<button class="btn btn-win btn-sm ob2025-standings-toggle" data-ob-id="${r.obligationId}">Mark Paid</button>` : ''}
+          ${obligationActionsHTML(status, r, sess, { payerName: r.payerName, recipientName: r.recipientName, obClass: 'ob2025-action' })}
         </div>`;
       }).join('') : (
         showFilter && filter !== 'all'
@@ -4286,12 +4504,9 @@ function renderSeason2025RecordSection() {
 }
 
 function bindSeason2025Sections(c) {
-  c.querySelectorAll('.ob2025-standings-toggle').forEach(btn=>{
+  c.querySelectorAll('.ob2025-action-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
-      const map={...(getSettings().ob2025||{})};
-      map[btn.dataset.obId]=true;
-      saveSetting('ob2025',map);
-      showToast('✅ Marked paid — the 2K25 ledger thins','success');
+      handleOb2025Action(btn.dataset.obId, btn.dataset.obAction);
       renderLeaderboard();
     });
   });
@@ -4305,6 +4520,7 @@ function bindSeason2025Sections(c) {
 
 function renderObligationsAdmin() {
   const obs=currentSeasonObligations(); const players=getPlayers(); const settings=getSettings();
+  const sess = getSession();
   const demoCount = getObligations().length - obs.length - getObligations().filter(o=>String(o.obligationId).startsWith('ob_2025_')).length;
   const purge = demoCount>0 ? `<div class="info-box mb-sm">🧹 ${demoCount} demo-week obligation${demoCount>1?'s':''} hidden. <button class="btn btn-ghost btn-sm" id="ob-purge-demo">Purge permanently</button></div>` : '';
   if(!obs.length)return purge+'<p class="text-muted text-sm">No obligations this season — the slate is clean until Week 1 finalizes.</p>';
@@ -4317,10 +4533,10 @@ function renderObligationsAdmin() {
         <div class="text-sm"><strong>${escHtml(payer?.displayName||'?')}</strong> owes <strong>${escHtml(recip?.displayName||'?')}</strong></div>
         <div class="text-xs text-muted">${escHtml(ob.weekId ? formatWeekLabel(w) : (ob.weekLabel||'manual'))} · ${escHtml(ob.note||ob.amountOrPrize||settings.weeklyPrize)}</div>
       </div>
-      <div class="flex gap-sm">
-        <span class="badge ${ob.status==='paid'?'badge-open':ob.status==='waived'?'badge-final':'badge-locked'}">${ob.status}</span>
-        ${ob.status!=='paid'?`<button class="btn btn-win btn-sm mark-paid-btn" data-ob-id="${ob.obligationId}">Mark Paid</button>`
-          :`<button class="btn btn-ghost btn-sm mark-unpaid-btn" data-ob-id="${ob.obligationId}">Undo</button>`}
+      <div class="flex gap-sm" style="align-items:center">
+        ${obligationActionsHTML(ob.status, ob, sess, {
+          payerName: payer?.displayName || '?', recipientName: recip?.displayName || '?', obClass: 'ob-action',
+        })}
         <button class="btn btn-ghost btn-sm ob-delete-btn" data-ob-id="${ob.obligationId}" title="Delete">🗑</button>
       </div>
     </div>`;
@@ -4332,16 +4548,49 @@ function renderObligationsAdmin() {
 function renderSeason2025ObligationsAdmin() {
   const paidMap = getSettings().ob2025 || {};
   const rows = season2025Obligations();
-  const open = rows.filter(r=>!paidMap[r.obligationId]).length;
+  const sess = getSession();
+  const open = rows.filter(r=>ob2025Status(paidMap, r.obligationId)!=='paid').length;
   return `<div class="text-xs text-muted mb-sm">${open} of ${rows.length} still outstanding · payable IN PERSON only</div>` +
     rows.map(r=>{
-      const paid = !!paidMap[r.obligationId];
+      const status = ob2025Status(paidMap, r.obligationId);
       return `<div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border)">
         <div><div class="text-sm"><strong>${escHtml(r.payerName)}</strong> owes <strong>${escHtml(r.recipientName)}</strong> — ${escHtml(r.prize)}</div>
           <div class="text-xs text-muted">${escHtml(r.weekLabel)}${r.note?` · ${escHtml(r.note)}`:''}</div></div>
-        <button class="btn ${paid?'btn-ghost':'btn-win'} btn-sm ob2025-toggle" data-ob-id="${r.obligationId}">${paid?'Paid ✓ (undo)':'Mark Paid'}</button>
+        ${obligationActionsHTML(status, r, sess, { payerName: r.payerName, recipientName: r.recipientName, obClass: 'ob2025-action' })}
       </div>`;
     }).join('');
+}
+
+/** Chat retention (UN-8x) — commissioner Data-tab card. CLIENT-SIDE HIDE ONLY,
+ *  Drew's explicit call: the backend has no row-removal endpoint, so a real
+ *  delete would need a new Code.gs endpoint + redeploy (RG-09 risk) for a
+ *  cosmetic gain at 6-player scale. This toggle only stops old messages from
+ *  RENDERING — nothing is ever deleted, and it is fully reversible. */
+function renderChatRetentionAdmin() {
+  const days = getRetentionDays();
+  const on = days > 0;
+  const stats = on ? retentionStats() : null;
+  const fmtDate = ts => ts ? new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+  const countLines = () => {
+    if (!on) return '';
+    if (stats.hiddenCount > 0) {
+      return `<p class="text-xs mt-sm">🙈 ${stats.hiddenCount} messages are older than 7 days and hidden (${escHtml(fmtDate(stats.oldestTs))} – ${escHtml(fmtDate(stats.newestTs))})</p>
+        ${stats.protectedCount > 0 ? `<p class="text-xs">🏛 ${stats.protectedCount} pinned messages in that range stay visible</p>` : ''}`;
+    }
+    if (stats.protectedCount > 0) {
+      return `<p class="text-xs mt-sm">🏛 ${stats.protectedCount} pinned messages in that range stay visible</p>`;
+    }
+    return '<p class="text-xs mt-sm">Nothing is hidden yet — no messages are older than 7 days.</p>';
+  };
+  return `
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="chat-retention-toggle" ${on ? 'checked' : ''} />
+      <span class="form-label" style="margin:0">Hide chat messages older than 7 days</span>
+    </label>
+    <p class="text-muted text-xs mt-sm">${on
+      ? 'Older messages stop showing in chat. Nothing is deleted — flip this back off and the full history returns. 🏛 Hall of Records pins are always visible, no matter how old.'
+      : 'Off — the full Locker Room history is visible.'}</p>
+    ${countLines()}`;
 }
 
 function renderCommLogin(c) {
@@ -4786,7 +5035,7 @@ function renderRulesPage() {
 
     <!-- v0.17.0 — Chat rules -->
     <div class="card mb-md">
-      <div class="rules-section"><h3>💬 The Locker Room</h3>
+      <div class="rules-section"><h3>💬 Chat</h3>
         <ul class="rules-list">
           <li><strong>One Locker Room.</strong> Everything happens in the main chat. Any message can be tagged to a game — tap 💬 on a game card and your post shows up both in that game's thread and in the Locker Room. Replies inherit the tag, so conversations stay findable. Untag with one tap if the talk drifts.</li>
           <li>React, reply, pin to the 🏛 Hall of Records, edit your own messages within 5 minutes, withdraw with a tombstone. The log is append-only.</li>
@@ -4944,10 +5193,23 @@ function renderCommExtrasV16(week, games) {
   if (demoSection) demoSection.insertAdjacentHTML('beforebegin', epHTML);
   else c.insertAdjacentHTML('beforeend', epHTML);
 
-  c.insertAdjacentHTML('beforeend', `
+  {
+    // Item A — commissioner chat on/off toggle. Placement: TOP of this
+    // existing card (RG-10: inside data-comm-tab="settings"), not a new
+    // card — a master on/off switch belongs above the features it governs.
+    const chatOn = isChatEnabled();
+    c.insertAdjacentHTML('beforeend', `
     <div class="admin-section" data-comm-tab="settings">
     <div class="card mb-md" id="comm-chat-card">
       <h3 style="color:var(--maroon)">📋 Chat &amp; S.C.R.I.B.E.</h3>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--border)">
+        <input type="checkbox" id="chat-enabled-toggle" ${chatOn ? 'checked' : ''} />
+        <span class="form-label" style="margin:0">Chat enabled</span>
+      </label>
+      <p class="text-muted text-xs mb-sm">${chatOn
+        ? 'Players can see and use chat. Turn off to hide it league-wide while you work on it.'
+        : 'Chat is hidden for everyone. Nothing is deleted — history returns when you turn it back on. Polling is stopped.'}</p>
+      <div class="divider"></div>
       <p class="text-muted text-xs">Tier 0 (deterministic lines) runs automatically with rate limits. Tier 1 lets you paste a reviewed batch of SCRIBE posts. The digest feeds recap generation.</p>
       <div class="flex gap-sm flex-wrap mb-sm">
         <button class="btn btn-secondary btn-sm" id="chat-digest-btn">📤 Copy weekly digest JSON</button>
@@ -4979,8 +5241,18 @@ function renderCommExtrasV16(week, games) {
       </div>
     </div>
     </div>`);
+  }
 
   // ── handlers ──
+  document.getElementById('chat-enabled-toggle')?.addEventListener('change', e => {
+    saveSetting('chatEnabled', e.target.checked);
+    try { refreshChatEnabled(); } catch {}
+    try { applyChatNavVisibility(); } catch {}
+    showToast(e.target.checked
+      ? '💬 Chat enabled — visible to everyone'
+      : '🙈 Chat disabled — hidden league-wide, nothing deleted', 'success');
+    renderCommPage();
+  });
   document.getElementById('ep-detect-btn')?.addEventListener('click', async () => {
     const st = document.getElementById('ep-detect-status');
     if (st) st.textContent = '⏳ Fetching scoring plays…';
@@ -5477,17 +5749,29 @@ function exportAllWeeklyResultsCSV() {
 }
 
 /** League-wide — obligations */
+/**
+ * Pure row-builder, exported so loadtest.mjs can assert on it without a DOM.
+ * The Status column emits `o.status` VERBATIM (not the mapped display label)
+ * — this is the commissioner's audit trail, and 'pending' must read distinct
+ * from 'unpaid'/'paid' or the approval feature's whole point (an in-flight
+ * claim is not yet settled) is invisible to the export.
+ */
+export function buildObligationsCsvRows(obs, playersById, weeksById) {
+  const rows=[['Obligation ID','Type','Week','Payer','Recipient','Amount/Prize','Status','Created','Paid At']];
+  for(const o of obs){
+    const w=weeksById[o.weekId];
+    rows.push([o.obligationId,o.type,w?formatWeekLabel(w):o.weekId,
+      playersById[o.payerPlayerId]||o.payerPlayerId, playersById[o.recipientPlayerId]||o.recipientPlayerId,
+      o.amountOrPrize||'', o.status, o.createdAt||'', o.paidAt||'']);
+  }
+  return rows;
+}
+
 function exportObligationsCSV() {
   const obs=getObligations();
   const players=Object.fromEntries(getPlayers().map(p=>[p.playerId,p.displayName]));
   const weeks=Object.fromEntries(getWeeks().map(w=>[w.weekId,w]));
-  const rows=[['Obligation ID','Type','Week','Payer','Recipient','Amount/Prize','Status','Created','Paid At']];
-  for(const o of obs){
-    const w=weeks[o.weekId];
-    rows.push([o.obligationId,o.type,w?formatWeekLabel(w):o.weekId,
-      players[o.payerPlayerId]||o.payerPlayerId, players[o.recipientPlayerId]||o.recipientPlayerId,
-      o.amountOrPrize||'', o.status, o.createdAt||'', o.paidAt||'']);
-  }
+  const rows = buildObligationsCsvRows(obs, players, weeks);
   downloadFile(toCsv(rows), `obligations.csv`);
   showToast('📥 Obligations CSV exported','success');
 }
@@ -5636,106 +5920,7 @@ function setDashboardColumnOrder(playerIds) {
  * abbreviation; unknown schools fall through to a smart-truncate that
  * preserves words like "State", "Tech", "A&M".
  */
-const TEAM_ABBR = {
-  // SEC
-  'Alabama':'BAMA','Arkansas':'ARK','Auburn':'AUB','Florida':'FLA','Georgia':'UGA',
-  'Kentucky':'UK','LSU':'LSU','Mississippi':'OLE','Ole Miss':'OLE','Mississippi State':'MSST',
-  'Missouri':'MIZZ','Oklahoma':'OU','South Carolina':'SCAR','Tennessee':'TENN','Texas':'TEX',
-  'Texas A&M':'TAMU','Vanderbilt':'VAN',
-  // Big Ten
-  'Illinois':'ILL','Indiana':'IND','Iowa':'IOWA','Maryland':'MD','Michigan':'MICH',
-  'Michigan State':'MSU','Minnesota':'MINN','Nebraska':'NEB','Northwestern':'NW','Ohio State':'OSU',
-  'Oregon':'ORE','Penn State':'PSU','Purdue':'PUR','Rutgers':'RUT','UCLA':'UCLA','USC':'USC',
-  'Washington':'WASH','Wisconsin':'WISC',
-  // Big 12
-  'Arizona':'ARIZ','Arizona State':'ASU','Baylor':'BAY','BYU':'BYU','Cincinnati':'CIN',
-  'Colorado':'COLO','Houston':'HOU','Iowa State':'ISU','Kansas':'KU','Kansas State':'KSU',
-  'Oklahoma State':'OKST','TCU':'TCU','Texas Tech':'TTU','UCF':'UCF','Utah':'UTAH',
-  'West Virginia':'WVU',
-  // ACC
-  'Boston College':'BC','California':'CAL','Clemson':'CLEM','Duke':'DUKE','Florida State':'FSU',
-  'Georgia Tech':'GT','Louisville':'LOU','Miami':'MIA','NC State':'NCST','North Carolina':'UNC',
-  'Notre Dame':'ND','Pittsburgh':'PITT','SMU':'SMU','Stanford':'STAN','Syracuse':'SYR',
-  'Virginia':'UVA','Virginia Tech':'VT','Wake Forest':'WAKE',
-  // AAC + selected G5
-  'Army':'ARMY','Charlotte':'CHAR','East Carolina':'ECU','Florida Atlantic':'FAU','Memphis':'MEM',
-  'Navy':'NAVY','North Texas':'UNT','Rice':'RICE','South Florida':'USF','Temple':'TEMP',
-  'Tulane':'TULN','Tulsa':'TLSA','UAB':'UAB','UTSA':'UTSA',
-  // Mountain West
-  'Air Force':'AF','Boise State':'BOIS','Colorado State':'CSU','Fresno State':'FRES',
-  'Hawaii':'HAW','Nevada':'NEV','New Mexico':'UNM','San Diego State':'SDSU','San Jose State':'SJSU',
-  'UNLV':'UNLV','Utah State':'USU','Wyoming':'WYO',
-  // Sun Belt
-  'Appalachian State':'APP','Arkansas State':'ARST','Coastal Carolina':'CCAR','Georgia Southern':'GASO',
-  'Georgia State':'GAST','James Madison':'JMU','Louisiana':'ULL','Louisiana Monroe':'ULM',
-  'Marshall':'MARS','Old Dominion':'ODU','South Alabama':'USA','Southern Miss':'USM',
-  'Texas State':'TXST','Troy':'TROY',
-  // MAC
-  'Akron':'AKR','Ball State':'BALL','Bowling Green':'BGSU','Buffalo':'BUFF','Central Michigan':'CMU',
-  'Eastern Michigan':'EMU','Kent State':'KENT','Massachusetts':'UMASS','Miami (OH)':'M-OH',
-  'Northern Illinois':'NIU','Ohio':'OHIO','Toledo':'TOL','Western Michigan':'WMU',
-  // CUSA
-  'FIU':'FIU','Jacksonville State':'JVST','Liberty':'LIB','Louisiana Tech':'LT','Middle Tennessee':'MTSU',
-  'New Mexico State':'NMSU','Sam Houston':'SHSU','UTEP':'UTEP','Western Kentucky':'WKU',
-  // Independents
-  'Connecticut':'UCONN','UConn':'UCONN',
-};
-
-/**
- * Build a Map<schoolName, uniqueAbbr> for all teams in a list of games.
- * Falls back to a smart-truncate for unknown schools, then runs a dedup pass
- * so no two teams in the same render share an abbreviation (appending the
- * first letter of the dropped word, e.g. "Sam Houston State" vs "Texas State"
- * → SHSU vs TXST already; "X State" vs "X State" gets X-1, X-2 as last resort).
- */
-function buildAbbrMap(games) {
-  const map = new Map();
-  const smartTrunc = (name) => {
-    if (!name) return '';
-    if (TEAM_ABBR[name]) return TEAM_ABBR[name];
-    const words = name.split(/\s+/).filter(Boolean);
-    // Single-word names: take first 4 chars uppercase.
-    if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
-    // Multi-word: take first letter of each word, max 5 chars (handles "A&M" specifically).
-    const initials = words.map(w => w.replace(/[^A-Za-z&]/g,'').charAt(0)).join('').toUpperCase().slice(0,5);
-    return initials || words[0].slice(0,4).toUpperCase();
-  };
-
-  const teams = new Set();
-  for (const g of games) {
-    if (g.homeTeam) teams.add(g.homeTeam);
-    if (g.awayTeam) teams.add(g.awayTeam);
-  }
-  // First pass: assign best-known abbreviation
-  for (const t of teams) map.set(t, smartTrunc(t));
-
-  // Dedup pass: any two teams sharing an abbreviation get suffixed
-  const byAbbr = new Map();
-  for (const [team, abbr] of map) {
-    if (!byAbbr.has(abbr)) byAbbr.set(abbr, []);
-    byAbbr.get(abbr).push(team);
-  }
-  for (const [abbr, teamList] of byAbbr) {
-    if (teamList.length === 1) continue;
-    // Try to use a more distinctive abbreviation — take first 3 chars of the
-    // first DIFFERENT word in each name. If still colliding, add a numeric suffix.
-    teamList.forEach((team, i) => {
-      const words = team.split(/\s+/).filter(Boolean);
-      // Pick the first word that's distinctive (not "State", "University" etc.)
-      const distinctive = words.find(w => !/^(state|university|college|the|of)$/i.test(w)) || words[0];
-      const candidate = (distinctive.slice(0,3) + abbr.slice(-1)).toUpperCase();
-      map.set(team, candidate);
-    });
-    // After replacement, do one final dedup check — append numeric suffix to any still-colliding
-    const seen = new Map();
-    for (const team of teamList) {
-      const a = map.get(team);
-      if (!seen.has(a)) { seen.set(a, 1); }
-      else { const n = seen.get(a) + 1; seen.set(a, n); map.set(team, a.slice(0, 3) + n); }
-    }
-  }
-  return map;
-}
+// TEAM_ABBR + buildAbbrMap moved to data-model.js (v0.17.2) — shared with chat.
 
 /**
  * Render a game as "Away @ Home" (CFB convention — @ reads "at").
@@ -5813,3 +5998,11 @@ function showSitePinGate() {
 }
 
 window.navigateTo=navigateTo;
+// Batch 3+4 item A/F — chat-ui.js cannot import app.js (app.js already imports
+// chat-ui.js; the reverse would be a cycle), so these two are exposed on
+// window as the same bridge window.navigateTo already establishes:
+//   - showToast: item A's "Chat has been turned off…" redirect toast.
+//   - livePickStatus: item F's game-thread header colors reuse this VERBATIM
+//     rather than re-deriving covering/trailing in chat-ui.js.
+window.showToast=showToast;
+window.livePickStatus=livePickStatus;

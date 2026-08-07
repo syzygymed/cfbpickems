@@ -110,6 +110,26 @@ export function season2025Obligations() {
   return rows;
 }
 
+/**
+ * v0.17.3 — normalize a `settings.ob2025` map entry to a status string.
+ *
+ * BACKWARD COMPATIBILITY, read this before touching it: before this batch the
+ * map was BOOLEAN-only (`{ [obligationId]: true }` = paid, absent = unpaid).
+ * The debt-approval feature (UN-8x) needs a third state ('pending'), so the
+ * map becomes a status map going forward — but every device that already
+ * marked a 2K25 drink paid has a literal `true` sitting in the Sheet right
+ * now. A legacy `true` MUST still resolve to 'paid', or those already-settled
+ * drinks silently revert to unpaid the moment this ships. That is the single
+ * most dangerous line in this feature — get it wrong and six people who
+ * already paid up get billed again.
+ */
+export function ob2025Status(map, obligationId) {
+  const v = (map || {})[obligationId];
+  if (v === true) return 'paid';                     // legacy boolean (pre-v0.17.3)
+  if (v === 'paid' || v === 'pending') return v;
+  return 'unpaid';                                    // absent, false, or anything unrecognized
+}
+
 /** Net drink position for the season (for the ledger summary line). */
 export function season2025Nets() {
   const nets = {};

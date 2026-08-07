@@ -87,7 +87,7 @@ export const SCRIBE_POOLS = {
     'SCRIBE NOTE: {NAME} experienced a backdoor cover. Documented without comment.',
     'Adverse Event Report — mechanism: garbage time. Patient: {NAME}. Prognosis: unchanged.',
     'The chart notes a terminal-minute decompensation for {NAME}. Filed.',
-    'Order busted at the gun. This encounter has been documented.',
+    'Pick busted at the gun. This encounter has been documented.',
     'Assessment: covered for 59 minutes. Plan: continue current management. — SCRIBE',
   ],
   lastPlaceTaunt: [

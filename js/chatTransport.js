@@ -9,14 +9,17 @@
  *   fetchBefore(seq,limit) -> { events }
  *   fetchHead()            -> { head }
  *   subscribe(onEvents)    -> unsubscribe()          (polling impl today; websocket later)
- *   heartbeat(playerId, lastSeenSeq) -> { present:[{playerId,ts,seen}] }
  *
  * No other module may reference Apps Script URLs, sheet names, or polling
  * mechanics. Swapping this file for a Supabase implementation is the entire
  * client-side migration.
  *
+ * v0.17.2 — presence removed (AD-19 amended). The `heartbeat()` method is gone
+ * from this interface; the server's `presence` endpoint stays deployed but is
+ * never called. Do not re-add a heartbeat without re-opening AD-19.
+ *
  * Transport details (Apps Script implementation):
- *  - Reads (head/since/before/presence/metrics) go over GET with query params —
+ *  - Reads (head/since/before/metrics) go over GET with query params —
  *    simple requests, no CORS preflight, and they hit the server-side
  *    CacheService fast paths.
  *  - Writes (append) go over POST with Content-Type text/plain — the same
@@ -92,11 +95,6 @@ export async function fetchBefore(seq, limit = 100) {
 export async function fetchHead() {
   const r = await get('chatHead');
   return { head: r.head ?? 0 };
-}
-
-export async function heartbeat(playerId, lastSeenSeq = 0) {
-  const r = await get('presence', { player: playerId, seen: lastSeenSeq });
-  return { present: r.present || [] };
 }
 
 export async function fetchMetrics(days = 7) {

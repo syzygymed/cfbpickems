@@ -136,7 +136,10 @@ export const WEEK_STATUS   = { DRAFT:'draft', OPEN:'open', LOCKED:'locked', LIVE
 export const GAME_STATUS   = { SCHEDULED:'scheduled', LIVE:'live', FINAL:'final' };
 export const PICK_RESULT   = { PENDING:'pending', LIVE:'live', WIN:'win', LOSS:'loss', NO_DECISION:'no_decision' };
 export const TIME_WINDOW   = { MORNING:'morning', AFTERNOON:'afternoon', EVENING:'evening', LATE:'late' };
-export const OBLIGATION_STATUS = { UNPAID:'unpaid', PAID:'paid', WAIVED:'waived' };
+// v0.17.3 — PENDING added: a payer's own "Mark Paid" claim needs the creditor
+// (or the commissioner) to confirm before it counts as settled (UN-8x debt
+// approval). See obligationNextStatus() below for the transition rules.
+export const OBLIGATION_STATUS = { UNPAID:'unpaid', PENDING:'pending', PAID:'paid', WAIVED:'waived' };
 export const STORAGE_MODE  = { LOCAL:'local', GOOGLE_SHEETS:'googleSheets' };
 
 export const DATA_QUALITY  = {
@@ -162,6 +165,24 @@ export const TIME_ZONES = [
   { key:'ET', label:'Eastern',  iana:'America/New_York' },
 ];
 export const DEFAULT_TZ = 'PT';
+
+/**
+ * The ONE emoji palette for the entire app (AD-20 extended to emoji, batch 3+4
+ * item G). Previously two independent literals drifted apart: `QUICK_EMOJI`
+ * (6, chat-ui.js) and `REACTION_PALETTE` (15, app.js's dashboard game
+ * reactions). Same lesson as `TEAM_ABBR`: a second literal for one concept is
+ * the bug, not a feature. data-model.js imports nothing, so it's the only
+ * module either app.js or chat-ui.js can both pull from without a cycle.
+ *
+ * Order matters here: chat's QUICK_EMOJI derives from the FRONT of this list
+ * (see chat-ui.js), so the most useful few are kept early. The dashboard's
+ * reaction picker shows the whole list in a grid, where order is cosmetic.
+ */
+export const REACTION_PALETTE = [
+  '👍', '👎', '🔥', '😂', '💀', '🍺',
+  '😁', '😭', '😅', '😬', '🤡', '👀',
+  '🫡', '🤘', '🤙', '☝️', '🚀', '🖕',
+];
 
 // Site-level access PIN — DEFAULT only. Commissioner can override this via
 // settings.sitePin (Commissioner → Security panel). verifySitePin() in storage.js
@@ -229,6 +250,20 @@ export const DEFAULT_SETTINGS = {
   customRules: null,
   autoRefreshInterval: 60,
   timezone: DEFAULT_TZ,
+  // v0.17.3 — chat retention (UN-8x). 0/absent = OFF (default): the full
+  // Locker Room history renders. A positive number is the render window in
+  // days; older non-pinned messages stop RENDERING (nothing is deleted — see
+  // chat.js isHiddenByRetention()). Default-when-missing story: old settings
+  // blobs without this field spread in as 0 via DEFAULT_SETTINGS, same as
+  // every other new field (CONVENTIONS #10).
+  chatRetentionDays: 0,
+  // Batch 3+4 item A — commissioner chat on/off toggle. Default TRUE: chat is
+  // on today, and a missing value (every pre-existing settings blob in the
+  // Sheet) must not silently disable it (CONVENTIONS #10). Synced through the
+  // storage seam so every player sees the same on/off state — this is NOT a
+  // device-local key (contrast with the teaser dismissal seq in chat-ui.js,
+  // which IS device-local under AD-12).
+  chatEnabled: true,
 };
 
 // ─── DEMO PLAYERS — correct alma maters and 2-letter initials ─────────────────
@@ -617,4 +652,225 @@ export function gameDataReadiness(game) {
     level = 'ok';
   }
   return { ready: level !== 'incomplete', level, issues };
+}
+
+
+// ── Team abbreviations (SHARED SOURCE) ───────────────────────────────────────
+// Moved here from app.js in v0.17.2 so the compact dashboard, the picks page,
+// and chat all render identical shorthand. data-model.js has no imports, so
+// every other module can pull from it without a cycle.
+// DO NOT create a second mapping anywhere. Import buildAbbrMap from here.
+
+export const TEAM_ABBR = {
+  // SEC
+  'Alabama':'BAMA','Arkansas':'ARK','Auburn':'AUB','Florida':'FLA','Georgia':'UGA',
+  'Kentucky':'UK','LSU':'LSU','Mississippi':'OLE','Ole Miss':'OLE','Mississippi State':'MSST',
+  'Missouri':'MIZZ','Oklahoma':'OU','South Carolina':'SCAR','Tennessee':'TENN','Texas':'TEX',
+  'Texas A&M':'TAMU','Vanderbilt':'VAN',
+  // Big Ten
+  'Illinois':'ILL','Indiana':'IND','Iowa':'IOWA','Maryland':'MD','Michigan':'MICH',
+  'Michigan State':'MSU','Minnesota':'MINN','Nebraska':'NEB','Northwestern':'NW','Ohio State':'OSU',
+  'Oregon':'ORE','Penn State':'PSU','Purdue':'PUR','Rutgers':'RUT','UCLA':'UCLA','USC':'USC',
+  'Washington':'WASH','Wisconsin':'WISC',
+  // Big 12
+  'Arizona':'ARIZ','Arizona State':'ASU','Baylor':'BAY','BYU':'BYU','Cincinnati':'CIN',
+  'Colorado':'COLO','Houston':'HOU','Iowa State':'ISU','Kansas':'KU','Kansas State':'KSU',
+  'Oklahoma State':'OKST','TCU':'TCU','Texas Tech':'TTU','UCF':'UCF','Utah':'UTAH',
+  'West Virginia':'WVU',
+  // ACC
+  'Boston College':'BC','California':'CAL','Clemson':'CLEM','Duke':'DUKE','Florida State':'FSU',
+  'Georgia Tech':'GT','Louisville':'LOU','Miami':'MIA','NC State':'NCST','North Carolina':'UNC',
+  'Notre Dame':'ND','Pittsburgh':'PITT','SMU':'SMU','Stanford':'STAN','Syracuse':'SYR',
+  'Virginia':'UVA','Virginia Tech':'VT','Wake Forest':'WAKE',
+  // AAC + selected G5
+  'Army':'ARMY','Charlotte':'CHAR','East Carolina':'ECU','Florida Atlantic':'FAU','Memphis':'MEM',
+  'Navy':'NAVY','North Texas':'UNT','Rice':'RICE','South Florida':'USF','Temple':'TEMP',
+  'Tulane':'TULN','Tulsa':'TLSA','UAB':'UAB','UTSA':'UTSA',
+  // Mountain West
+  'Air Force':'AF','Boise State':'BOIS','Colorado State':'CSU','Fresno State':'FRES',
+  'Hawaii':'HAW','Nevada':'NEV','New Mexico':'UNM','San Diego State':'SDSU','San Jose State':'SJSU',
+  'UNLV':'UNLV','Utah State':'USU','Wyoming':'WYO',
+  // Sun Belt
+  'Appalachian State':'APP','Arkansas State':'ARST','Coastal Carolina':'CCAR','Georgia Southern':'GASO',
+  'Georgia State':'GAST','James Madison':'JMU','Louisiana':'ULL','Louisiana Monroe':'ULM',
+  'Marshall':'MARS','Old Dominion':'ODU','South Alabama':'USA','Southern Miss':'USM',
+  'Texas State':'TXST','Troy':'TROY',
+  // MAC
+  'Akron':'AKR','Ball State':'BALL','Bowling Green':'BGSU','Buffalo':'BUFF','Central Michigan':'CMU',
+  'Eastern Michigan':'EMU','Kent State':'KENT','Massachusetts':'UMASS','Miami (OH)':'M-OH',
+  'Northern Illinois':'NIU','Ohio':'OHIO','Toledo':'TOL','Western Michigan':'WMU',
+  // CUSA
+  'FIU':'FIU','Jacksonville State':'JVST','Liberty':'LIB','Louisiana Tech':'LT','Middle Tennessee':'MTSU',
+  'New Mexico State':'NMSU','Sam Houston':'SHSU','UTEP':'UTEP','Western Kentucky':'WKU',
+  // Independents
+  'Connecticut':'UCONN','UConn':'UCONN',
+
+  // ── ESPN long-form / alternate location strings ────────────────────────────
+  // homeTeam/awayTeam come from ESPN's `team.location` (data-provider.js ~L280),
+  // which is NOT stable across schools or seasons — some return the marketing
+  // initialism ("USC"), some the full school name ("Southern California").
+  // A miss here silently degrades to the initials fallback, which is how
+  // "Southern California" rendered as "SC" while the dashboard said "USC".
+  // Every alias below resolves to a school ALREADY keyed above — these add no
+  // new abbreviations, they only stop known schools falling through.
+  'Southern California':'USC',        // corroborated: ALMA_MATER_EXACT_PATTERNS.USC, this file
+  'Miami (FL)':'MIA',                 // disambiguated counterpart of 'Miami (OH)'
+  'Louisiana State':'LSU',
+  'Texas Christian':'TCU',
+  'Brigham Young':'BYU',
+  'Central Florida':'UCF',
+  'Southern Methodist':'SMU',
+  'North Carolina State':'NCST',
+  'Florida International':'FIU',
+  'Middle Tennessee State':'MTSU',
+  'Southern Mississippi':'USM',
+  'Sam Houston State':'SHSU',
+  'Army West Point':'ARMY',
+  'Pitt':'PITT',
+  'UMass':'UMASS',
+  // Hawaii ships with three different apostrophes depending on the feed:
+  // ASCII ('), typographic (’), and the Hawaiian okina (ʻ). All are one school.
+  "Hawai'i":'HAW','Hawai’i':'HAW','Hawaiʻi':'HAW',
+  // San Jose State's ESPN location carries the accent.
+  'San José State':'SJSU',
+  // Louisiana's two branch campuses appear hyphenated and as "UL X".
+  'Louisiana-Lafayette':'ULL','UL Lafayette':'ULL',
+  'Louisiana-Monroe':'ULM','UL Monroe':'ULM',
+};
+
+/**
+ * Build a Map<schoolName, uniqueAbbr> for all teams in a list of games.
+ * Falls back to a smart-truncate for unknown schools, then runs a dedup pass
+ * so no two teams in the same render share an abbreviation (appending the
+ * first letter of the dropped word, e.g. "Sam Houston State" vs "Texas State"
+ * → SHSU vs TXST already; "X State" vs "X State" gets X-1, X-2 as last resort).
+ */
+export function buildAbbrMap(games) {
+  const map = new Map();
+  const smartTrunc = (name) => {
+    if (!name) return '';
+    if (TEAM_ABBR[name]) return TEAM_ABBR[name];
+    const words = name.split(/\s+/).filter(Boolean);
+    // Single-word names: take first 4 chars uppercase.
+    if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
+    // Multi-word: take first letter of each word, max 5 chars (handles "A&M" specifically).
+    const initials = words.map(w => w.replace(/[^A-Za-z&]/g,'').charAt(0)).join('').toUpperCase().slice(0,5);
+    return initials || words[0].slice(0,4).toUpperCase();
+  };
+
+  const teams = new Set();
+  for (const g of games) {
+    if (g.homeTeam) teams.add(g.homeTeam);
+    if (g.awayTeam) teams.add(g.awayTeam);
+  }
+  // First pass: assign best-known abbreviation
+  for (const t of teams) map.set(t, smartTrunc(t));
+
+  // Dedup pass: any two teams sharing an abbreviation get suffixed
+  const byAbbr = new Map();
+  for (const [team, abbr] of map) {
+    if (!byAbbr.has(abbr)) byAbbr.set(abbr, []);
+    byAbbr.get(abbr).push(team);
+  }
+  for (const [abbr, teamList] of byAbbr) {
+    if (teamList.length === 1) continue;
+    // Try to use a more distinctive abbreviation — take first 3 chars of the
+    // first DIFFERENT word in each name. If still colliding, add a numeric suffix.
+    teamList.forEach((team, i) => {
+      const words = team.split(/\s+/).filter(Boolean);
+      // Pick the first word that's distinctive (not "State", "University" etc.)
+      const distinctive = words.find(w => !/^(state|university|college|the|of)$/i.test(w)) || words[0];
+      const candidate = (distinctive.slice(0,3) + abbr.slice(-1)).toUpperCase();
+      map.set(team, candidate);
+    });
+    // After replacement, do one final dedup check — append numeric suffix to any still-colliding
+    const seen = new Map();
+    for (const team of teamList) {
+      const a = map.get(team);
+      if (!seen.has(a)) { seen.set(a, 1); }
+      else { const n = seen.get(a) + 1; seen.set(a, n); map.set(team, a.slice(0, 3) + n); }
+    }
+  }
+  return map;
+}
+
+/**
+ * Shorthand for one team, using the shared table with the same smart-truncate
+ * fallback as buildAbbrMap. Use buildAbbrMap when you have a slate — it also
+ * dedups across the render so two teams never share an abbreviation.
+ */
+export function teamAbbr(name) {
+  if (!name) return '';
+  if (TEAM_ABBR[name]) return TEAM_ABBR[name];
+  const words = String(name).split(/\s+/).filter(Boolean);
+  if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
+  const initials = words.map(w => w.replace(/[^A-Za-z&]/g, '').charAt(0)).join('').toUpperCase().slice(0, 5);
+  return initials || words[0].slice(0, 4).toUpperCase();
+}
+
+// ─── DEBT-PAYMENT APPROVAL (UN-8x) ─────────────────────────────────────────
+// One state machine, shared by BOTH the current-season obligation ledger
+// (`cfbp_obligations`, full records) and the 2K25 carryover ledger
+// (`settings.ob2025`, a status-map overlay on baked history — see
+// history-2025.js `ob2025Status()`). Both shapes carry `payerPlayerId` /
+// `recipientPlayerId`, so obligationRole()/obligationNextStatus() work
+// unmodified against either one. Pure — no storage access — so every
+// transition is unit-testable without a DOM.
+
+/** Status → { label, badgeClass }. ONE table so Standings, the commissioner
+ *  Players-tab card, and the 2K25 carryover card can never disagree about
+ *  what a status is called or which (pre-existing) badge color it gets.
+ *  Reuses existing badge classes only — no new CSS variable, no theme risk. */
+export const OBLIGATION_STATUS_DISPLAY = {
+  unpaid:  { label: 'Unpaid',  badgeClass: 'badge-locked' },
+  pending: { label: 'Pending', badgeClass: 'badge-nd' },
+  paid:    { label: 'Paid ✓',  badgeClass: 'badge-open' },
+  waived:  { label: 'Waived',  badgeClass: 'badge-final' },
+};
+export function obligationStatusDisplay(status) {
+  return OBLIGATION_STATUS_DISPLAY[status] || OBLIGATION_STATUS_DISPLAY.unpaid;
+}
+
+/**
+ * A viewer's relationship to one obligation. Priority: admin > creditor >
+ * payer > bystander. An admin who ALSO happens to be the payer or the
+ * creditor still gets commissioner-level authority — the spec's rule is that
+ * the commissioner's own action always IS the verification, with no carve-out
+ * for "unless it's their own debt." `sess` is `{isAdmin, playerId}` (the
+ * shape `getSession()` already returns).
+ */
+export function obligationRole(sess, ob) {
+  const isAdmin = !!sess?.isAdmin;
+  const playerId = sess?.playerId;
+  if (isAdmin) return 'admin';
+  if (playerId && ob && playerId === ob.recipientPlayerId) return 'creditor';
+  if (playerId && ob && playerId === ob.payerPlayerId) return 'payer';
+  return 'bystander';
+}
+
+/**
+ * Pure obligation state-machine transition. Returns the NEXT status string,
+ * or `null` if this (status, role, action) combination is not a legal move —
+ * callers must refuse the action (and re-check role server-side; the UI
+ * hiding a button is not a permission boundary by itself).
+ *
+ *   unpaid  --payer "mark"-->             pending   (needs confirmation)
+ *   unpaid  --creditor/admin "mark"-->    paid      (their action IS the verification)
+ *   pending --creditor/admin "confirm"--> paid
+ *   pending --creditor/admin "deny"-->    unpaid
+ *   paid    --admin "undo"-->             unpaid    (pre-existing affordance, unchanged)
+ *
+ * Nothing here ever multiplies or scores anything (CONVENTIONS #22-23) —
+ * obligations are drink debts, not pick results.
+ */
+export function obligationNextStatus(status, role, action) {
+  if (status === 'unpaid' && action === 'mark') {
+    if (role === 'payer') return 'pending';
+    if (role === 'creditor' || role === 'admin') return 'paid';
+    return null;
+  }
+  if (status === 'pending' && action === 'confirm' && (role === 'creditor' || role === 'admin')) return 'paid';
+  if (status === 'pending' && action === 'deny' && (role === 'creditor' || role === 'admin')) return 'unpaid';
+  if (status === 'paid' && action === 'undo' && role === 'admin') return 'unpaid';
+  return null;
 }
