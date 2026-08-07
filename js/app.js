@@ -4,8 +4,8 @@
  * One-stop place to update the user-visible version string + release date.
  * Surfaced in the footer of the Rules tab (Priority 12).
  */
-export const APP_VERSION = 'v0.17.0';
-export const APP_VERSION_DATE = '2026-08-05';
+export const APP_VERSION = 'v0.17.1';
+export const APP_VERSION_DATE = '2026-08-06';
 
 
 import {
@@ -18,6 +18,7 @@ import {
   THEMES,
   HISTORICAL_DEMO_WEEK, HISTORICAL_DEMO_GAMES, REAL_WEEK_1_2026,
   SITE_PIN,
+  getAutoLockOffsetMinutes, getAutoLiveEnabled, getAutoFinalizeEnabled,
 } from './data-model.js';
 
 import {
@@ -65,6 +66,7 @@ import {
   calculateWeeklyResults, calculateSeasonStandings,
   evaluatePick, getPickStatusLabel, getPickStatusClass,
   calculateAtsWinner, calculateAlmaMaterTotal,
+  computeEffectiveLockAt, computeEffectiveLiveAt, computeFirstKickoff, computeLastKickoff,
 } from './scoring.js';
 
 import {
@@ -429,14 +431,25 @@ function renderPicksPage() {
   renderPicksPageCurrent();
   c.insertAdjacentHTML('afterbegin', renderPicksWeekNav(currentWeek, currentWeek));
   bindPicksWeekNav();
-  c.insertAdjacentHTML('beforeend', renderPicksFooterHTML(currentWeek));
+  // Hide the permanent-record / previous-recap footer when a logged-in player
+  // is actively engaged with THIS week (picking or reviewing their picks). The
+  // permanent record is context for outsiders and the commissioner — a signed-in
+  // player's picks tab should stay focused on the games at hand.
+  const session = getSession();
+  const playerActivelyInPicks = session?.playerVerified && session?.playerId && !session?.isAdmin;
+  if (!playerActivelyInPicks) {
+    c.insertAdjacentHTML('beforeend', renderPicksFooterHTML(currentWeek));
+  }
 }
 
-/** Weeks a player may browse on the Picks tab: current week + anything locked/live/final. */
+/** Weeks a player may browse on the Picks tab: current week + anything locked/live/final. Demo weeks are commissioner-only. */
 function picksNavWeeks() {
   const cur = getCurrentWeek();
+  const session = getSession();
+  const isCommissioner = !!session?.isAdmin;
   const weeks = getWeeks().filter(w => w.showInHistory !== false && w.status !== WEEK_STATUS.DRAFT &&
-    (w.dataSourceMode !== 'demo' || w.weekId === cur?.weekId));
+    // Demo weeks: commissioner sees always; non-commissioners never see (even if it's the active week).
+    (w.dataSourceMode !== 'demo' || isCommissioner));
   return weeks.sort((a, b) => String(a.season).localeCompare(String(b.season)) || a.weekNumber - b.weekNumber);
 }
 
@@ -562,6 +575,7 @@ function renderPicksPageCurrent() {
 
   c.innerHTML = `
     ${renderWeekBanner(week)}
+    ${renderPicksTiming(week, games)}
     <div class="flex-between mb-md">
       <div><span class="text-maroon font-display" style="font-size:1.05rem">${escHtml(displayName)}</span>
       <span class="text-muted text-sm"> — ${state.editingPicks?'update your picks':'make your picks'}</span></div>
@@ -713,6 +727,7 @@ function renderSubmittedView(c, week, games, session, displayName) {
   const { allowed: canEdit } = canPlayerSubmitPicks(week, session.playerId);
   c.innerHTML = `
     ${renderWeekBanner(week)}
+    ${renderPicksTiming(week, games)}
     <div class="flex-between mb-md">
       <div><span class="text-maroon font-display" style="font-size:1.05rem">${escHtml(displayName)}</span>
       <span class="text-muted text-sm"> — picks submitted ✓</span></div>
@@ -754,6 +769,30 @@ function renderWeekBanner(week) {
         ${isDemoWeek?'<span class="demo-label">DEMO DATA</span>':''}</div>
       <div class="week-banner-blurb">${escHtml(week.blurb)}</div>
     </div>
+  </div>`;
+}
+
+/**
+ * Small timing info line shown on the picks page so players know when picks
+ * auto-lock and when games go live. Uses the effective (commissioner-set OR
+ * derived) times so a bespoke picksLockAt override shows up here too.
+ * Hidden entirely if the week has no games yet or is already live/final.
+ */
+function renderPicksTiming(week, games) {
+  if (!week || !games?.length) return '';
+  if (week.status === WEEK_STATUS.LIVE || week.status === WEEK_STATUS.FINAL) return '';
+  const lockAt = computeEffectiveLockAt(week, games);
+  const liveAt = computeEffectiveLiveAt(week, games);
+  if (!lockAt && !liveAt) return '';
+  const tz = getTimezone();
+  const fmt = (d) => d ? formatGameTime(d.toISOString(), tz) : '—';
+  const isLocked = week.status === WEEK_STATUS.LOCKED;
+  const now = Date.now();
+  const lockPassed = lockAt && now >= lockAt.getTime();
+  const livePassed = liveAt && now >= liveAt.getTime();
+  return `<div class="picks-timing-info mb-md">
+    <span class="pt-item ${lockPassed?'pt-passed':''}">🔒 <strong>Picks lock:</strong> ${escHtml(fmt(lockAt))}${isLocked?' <em>(locked)</em>':''}</span>
+    <span class="pt-item ${livePassed?'pt-passed':''}">🏈 <strong>Games live:</strong> ${escHtml(fmt(liveAt))}</span>
   </div>`;
 }
 
@@ -1089,13 +1128,25 @@ function renderDashboard() {
 
 function renderDashboardInner() {
   const c=document.getElementById('page-dashboard'); if(!c)return;
-  const session=getSession();  const allWeeks=getWeeks().filter(w=>w.status!==WEEK_STATUS.DRAFT).sort((a,b)=>b.weekNumber-a.weekNumber);
+  const session=getSession();
+  const isCommissioner = !!session?.isAdmin;
+  // Demo weeks are commissioner-only. Filter them out of the week list players see.
+  const allWeeks=getWeeks().filter(w =>
+    w.status!==WEEK_STATUS.DRAFT &&
+    (w.dataSourceMode!=='demo' || isCommissioner)
+  ).sort((a,b)=>b.weekNumber-a.weekNumber);
   const currentWeek=getCurrentWeek();
-  if(!currentWeek&&!allWeeks.length){c.innerHTML=emptyState('📊','No Weeks Yet','Commissioner needs to open a week.');return;}
+  const currentWeekVisible = currentWeek && (currentWeek.dataSourceMode !== 'demo' || isCommissioner);
+  if(!currentWeekVisible && !allWeeks.length){c.innerHTML=emptyState('📊','No Weeks Yet','Commissioner needs to open a week.');return;}
 
-  const displayWeekId=state.dashboardWeekId||currentWeek?.weekId||allWeeks[0]?.weekId;
-  const week=getWeek(displayWeekId)||currentWeek||allWeeks[0];
+  const displayWeekId=state.dashboardWeekId||(currentWeekVisible?currentWeek?.weekId:null)||allWeeks[0]?.weekId;
+  const week=getWeek(displayWeekId)||(currentWeekVisible?currentWeek:null)||allWeeks[0];
   if(!week){c.innerHTML=emptyState('📊','No Week','');return;}
+  // Safety: if a stale state.dashboardWeekId points at a demo week, snap back.
+  if (week.dataSourceMode === 'demo' && !isCommissioner) {
+    state.dashboardWeekId = allWeeks[0]?.weekId || null;
+    return renderDashboardInner();
+  }
 
   const eff = getEffectiveWeekStatus(week);
   const isPublic = eff === 'live' || eff === 'final';
@@ -1984,7 +2035,7 @@ function renderAlmaMaterRankings() {
     const almaDisplay = ALMA_MATER_DISPLAY[alma] || alma;
     return `<div class="alma-rank-row">
       <span class="alma-rank-school">${escHtml(almaDisplay)}</span>
-      ${player?`<span class="alma-rank-player text-muted text-xs">${escHtml(player.displayName)}</span>`:''}
+      <span class="alma-rank-player text-muted text-xs">${player ? escHtml(player.displayName) : ''}</span>
       <span class="alma-rank-value">${rankStr}</span>
     </div>`;
   });
@@ -2113,11 +2164,61 @@ function renderCommPage() {
                   value="${week.picksOpenAt?new Date(week.picksOpenAt).toISOString().slice(0,16):''}" />
               </div>
               <div class="form-group" style="flex:1;min-width:180px;margin:0">
-                <label class="form-label">Auto-Lock At</label>
+                <label class="form-label">Auto-Lock At (override)
+                  <span class="text-muted text-xs">— blank = auto-derive</span>
+                </label>
                 <input class="form-input" type="datetime-local" id="picks-lock-at"
                   value="${week.picksLockAt?new Date(week.picksLockAt).toISOString().slice(0,16):''}" />
               </div>
             </div>
+            <!-- Auto-transition config: how long before first kickoff to lock,
+                 and whether to auto-transition to LIVE/pending-FINAL. -->
+            <div class="auto-transition-config">
+              <div class="card-title mb-sm">🔄 Auto-Transitions</div>
+              <div class="flex gap-sm flex-wrap mb-sm">
+                <div class="form-group" style="flex:1;min-width:180px;margin:0">
+                  <label class="form-label">Lock N minutes before first kickoff
+                    <span class="text-muted text-xs">— default 30</span>
+                  </label>
+                  <input class="form-input" type="number" min="0" max="720"
+                    id="auto-lock-offset" value="${getAutoLockOffsetMinutes(week)}" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                  <input type="checkbox" id="auto-live-enabled" ${getAutoLiveEnabled(week)?'checked':''} />
+                  <span class="form-label" style="margin:0">Auto-transition LOCKED → LIVE at first kickoff</span>
+                </label>
+              </div>
+              <div class="form-group">
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                  <input type="checkbox" id="auto-final-enabled" ${getAutoFinalizeEnabled(week)?'checked':''} />
+                  <span class="form-label" style="margin:0">Prompt for finalization when all games are final</span>
+                </label>
+                <p class="text-muted text-xs mt-sm">Auto-finalize never happens without a commissioner click — it just shows a confirm prompt.</p>
+              </div>
+              ${(() => {
+                const games = getGames(week.weekId);
+                const lockAt = computeEffectiveLockAt(week, games);
+                const liveAt = computeEffectiveLiveAt(week, games);
+                if (!lockAt && !liveAt) return '<p class="text-muted text-xs">Effective times will show once games are on the slate.</p>';
+                const tz = getTimezone();
+                const fmt = (d) => d ? formatGameTime(d.toISOString(), tz) : '—';
+                return `<div class="effective-times-preview">
+                  <div><strong>Effective lock:</strong> ${escHtml(fmt(lockAt))}</div>
+                  <div><strong>Effective live:</strong> ${escHtml(fmt(liveAt))}</div>
+                </div>`;
+              })()}
+            </div>
+            ${week.pendingFinalization ? `
+              <div class="pending-final-banner">
+                <div><strong>⏰ All games are final.</strong> Ready to close this week and lock standings?</div>
+                <div class="flex gap-sm mt-sm">
+                  <button class="btn btn-primary btn-sm" id="confirm-finalize-btn">✅ Confirm Finalization</button>
+                  <button class="btn btn-ghost btn-sm" id="dismiss-pending-btn">Not yet</button>
+                </div>
+              </div>
+            ` : ''}
             <button class="btn btn-primary btn-sm" id="save-week-settings-btn">Save Week Settings</button>
             <div class="form-group mt-md">
               <label class="form-label">Weekly Blurb</label>
@@ -3167,11 +3268,33 @@ function bindCommEventListeners(week, games, availGames, suggested, settings, al
     const roundLabel=document.getElementById('week-round-label')?.value.trim()||'';
     const espnWeekNumber=document.getElementById('week-espn-num')?.value.trim()||'';
     const showInHistory=document.getElementById('week-show-history')?.checked!==false;
+    // Auto-transition config
+    const autoLockOffsetRaw = parseInt(document.getElementById('auto-lock-offset')?.value);
+    const autoLockOffsetMinutes = Number.isFinite(autoLockOffsetRaw) && autoLockOffsetRaw >= 0 ? autoLockOffsetRaw : 30;
+    const autoLiveEnabled = document.getElementById('auto-live-enabled')?.checked !== false;
+    const autoFinalizeEnabled = document.getElementById('auto-final-enabled')?.checked !== false;
     saveWeek({...week,dataSourceMode:mode,startDate,endDate,roundLabel,espnWeekNumber,showInHistory,
       picksOpenAt:openRaw?new Date(openRaw).toISOString():null,
       picksLockAt:lockRaw?new Date(lockRaw).toISOString():null,
+      autoLockOffsetMinutes, autoLiveEnabled, autoFinalizeEnabled,
     });
     refreshHeader(); showToast('Week settings saved ✅','success'); renderCommPage();
+  });
+
+  // Pending-finalization prompt handlers (auto-transition ready → commissioner confirms)
+  document.getElementById('confirm-finalize-btn')?.addEventListener('click', ()=>{
+    if(!week)return;
+    const upd = { ...week, status: WEEK_STATUS.FINAL, finalizedAt: new Date().toISOString(), pendingFinalization: false };
+    saveWeek(upd);
+    finalizeWeek(week);
+    refreshHeader();
+    showToast('Week finalized — standings locked ✅','success');
+    renderCommPage();
+  });
+  document.getElementById('dismiss-pending-btn')?.addEventListener('click', ()=>{
+    if(!week)return;
+    saveWeek({ ...week, pendingFinalization: false });
+    renderCommPage();
   });
   document.getElementById('save-blurb-btn')?.addEventListener('click', ()=>{
     if(!week)return;
@@ -4083,14 +4206,38 @@ function currentSeasonObligations() {
 function renderSeason2025OutstandingSection() {
   const paidMap = getSettings().ob2025 || {};
   const rows = season2025Obligations();
-  const openRows = rows.filter(r => !paidMap[r.obligationId]);
+  const openRowsAll = rows.filter(r => !paidMap[r.obligationId]);
   const nets = season2025Nets();
   const fmtNet = n => n > 0 ? `+${n}` : `${n}`;
   const sess = getSession();
+  // Filter: 'all' | 'iowe' | 'owedto'. Only shown when a player is signed in
+  // (bystanders and admins in general commissioner-mode see all).
+  const showFilter = !!(sess.playerId && sess.playerVerified);
+  const filter = state.ob2025Filter || 'all';
+  const filterRows = (rowsList) => {
+    if (!showFilter || filter === 'all') return rowsList;
+    if (filter === 'iowe')   return rowsList.filter(r => r.payerPlayerId    === sess.playerId);
+    if (filter === 'owedto') return rowsList.filter(r => r.recipientPlayerId === sess.playerId);
+    return rowsList;
+  };
+  const openRows = filterRows(openRowsAll);
+  const netMe = sess.playerId && (() => {
+    const p = getPlayer(sess.playerId);
+    if (!p) return null;
+    return nets[p.displayName];
+  })();
   return `
     <div class="admin-section-title">🍺 2K25 Outstanding Balances</div>
     <div class="card mb-md">
-      <p class="text-muted text-xs mb-sm">${openRows.length} of ${rows.length} drinks from last season remain unpaid. Per league bylaw: settled IN PERSON only. Net position: ${Object.entries(nets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`${escHtml(n)} ${fmtNet(v)}`).join(' · ')}.</p>
+      <p class="text-muted text-xs mb-sm">${openRowsAll.length} of ${rows.length} drinks from last season remain unpaid. Per league bylaw: settled IN PERSON only. Net position: ${Object.entries(nets).sort((a,b)=>b[1]-a[1]).map(([n,v])=>`${escHtml(n)} ${fmtNet(v)}`).join(' · ')}.</p>
+      ${showFilter ? `
+        <div class="ob-filter-tabs mb-sm">
+          <button type="button" class="ob-filter-tab${filter==='all'?' active':''}" data-ob-filter="all">All (${openRowsAll.length})</button>
+          <button type="button" class="ob-filter-tab${filter==='iowe'?' active':''}" data-ob-filter="iowe">What I owe (${openRowsAll.filter(r=>r.payerPlayerId===sess.playerId).length})</button>
+          <button type="button" class="ob-filter-tab${filter==='owedto'?' active':''}" data-ob-filter="owedto">Owed to me (${openRowsAll.filter(r=>r.recipientPlayerId===sess.playerId).length})</button>
+          ${Number.isFinite(netMe) ? `<span class="ob-net-me ${netMe>0?'net-positive':netMe<0?'net-negative':''}">Your net: ${fmtNet(netMe)}</span>` : ''}
+        </div>
+      ` : ''}
       ${openRows.length ? openRows.map(r => {
         const canMark = sess.isAdmin || sess.playerId === r.payerPlayerId;
         return `<div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border)">
@@ -4098,7 +4245,11 @@ function renderSeason2025OutstandingSection() {
             <span class="text-xs text-muted">(${escHtml(r.weekLabel)})</span></div>
           ${canMark ? `<button class="btn btn-win btn-sm ob2025-standings-toggle" data-ob-id="${r.obligationId}">Mark Paid</button>` : ''}
         </div>`;
-      }).join('') : '<p class="text-muted text-sm">All settled. The ledger rests — for now.</p>'}
+      }).join('') : (
+        showFilter && filter !== 'all'
+          ? `<p class="text-muted text-sm">Nothing here — you're clear on ${filter==='iowe'?'what you owe':'what you\'re owed'}.</p>`
+          : '<p class="text-muted text-sm">All settled. The ledger rests — for now.</p>'
+      )}
     </div>`;
 }
 
@@ -4141,6 +4292,12 @@ function bindSeason2025Sections(c) {
       map[btn.dataset.obId]=true;
       saveSetting('ob2025',map);
       showToast('✅ Marked paid — the 2K25 ledger thins','success');
+      renderLeaderboard();
+    });
+  });
+  c.querySelectorAll('.ob-filter-tab').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      state.ob2025Filter = btn.dataset.obFilter;
       renderLeaderboard();
     });
   });
@@ -4629,11 +4786,11 @@ function renderRulesPage() {
 
     <!-- v0.17.0 — Chat rules -->
     <div class="card mb-md">
-      <div class="rules-section"><h3>💬 League Chat</h3>
+      <div class="rules-section"><h3>💬 The Locker Room</h3>
         <ul class="rules-list">
-          <li><strong>One room.</strong> Everything happens in the main chat. Any message can be tagged to a game — tap 💬 on a game card and your post shows up both in that game's thread and in the room. Replies inherit the tag, so conversations stay findable. Untag with one tap if the talk drifts.</li>
+          <li><strong>One Locker Room.</strong> Everything happens in the main chat. Any message can be tagged to a game — tap 💬 on a game card and your post shows up both in that game's thread and in the Locker Room. Replies inherit the tag, so conversations stay findable. Untag with one tap if the talk drifts.</li>
           <li>React, reply, pin to the 🏛 Hall of Records, edit your own messages within 5 minutes, withdraw with a tombstone. The log is append-only.</li>
-          <li>At lock, the room gets <strong>the reveal</strong> — everyone's picks posted at once. Game finals, standings, and Extra Point results file in automatically. Nothing ever leaks a pick before lock.</li>
+          <li>At lock, the Locker Room gets <strong>the reveal</strong> — everyone's picks posted at once. Game finals, standings, and Extra Point results file in automatically. Nothing ever leaks a pick before lock.</li>
           <li><strong>S.C.R.I.B.E. is the seventh member of this league.</strong> Records custodian, attending physician of the chart. It documents lock times, adverse events, live-game complications, and outstanding balances on its own schedule — and it answers when addressed. It is not summoned. It is on duty.</li>
           <li>House rule, inherited and non-negotiable: savage about football, never about real life.</li>
         </ul>
@@ -4984,6 +5141,12 @@ function setupAutoRefresh() {
   const{autoRefreshInterval=60}=getSettings();
   if(!autoRefreshInterval)return;
   _refreshTimer=setInterval(async()=>{
+    // Auto-transition check runs EVERY tick regardless of active tab or week
+    // mode (demo weeks are skipped inside the helper). Transitions affect all
+    // users so whichever device ticks first writes the new status to the
+    // shared backend and everyone else picks it up on next hydrate.
+    tickAutoTransition();
+
     if(state.currentTab!=='dashboard') return;
     const week=getCurrentWeek();
     if(!week) return;
@@ -4994,6 +5157,80 @@ function setupAutoRefresh() {
     await doRefreshScores(week,getGames(week.weekId));
     renderDashboard();
   },autoRefreshInterval*1000);
+  // Run one auto-transition check immediately so an app that opens after the
+  // lock time has passed doesn't have to wait for the next tick.
+  tickAutoTransition();
+}
+
+/**
+ * Check the active week and auto-transition its status if warranted:
+ *   OPEN → LOCKED   at (first kickoff − autoLockOffsetMinutes), or when picksLockAt hits
+ *   LOCKED → LIVE   at first kickoff, if autoLiveEnabled
+ *   LIVE → pendingFinalization=true when every game is FINAL, if autoFinalizeEnabled
+ *     (Commissioner sees a confirm prompt and completes the transition manually.)
+ *
+ * Demo weeks are skipped — those are commissioner-driven simulations.
+ */
+function tickAutoTransition() {
+  try {
+    const week = getCurrentWeek();
+    if (!week) return;
+    if (week.dataSourceMode === 'demo') return;
+
+    const games = getGames(week.weekId);
+    if (!games?.length) return;
+
+    const now = Date.now();
+    let changed = false;
+    let next = { ...week };
+
+    // OPEN → LOCKED
+    if (week.status === WEEK_STATUS.OPEN) {
+      const lockAt = computeEffectiveLockAt(week, games);
+      if (lockAt && now >= lockAt.getTime()) {
+        next.status = WEEK_STATUS.LOCKED;
+        next.lockedAt = new Date().toISOString();
+        changed = true;
+        // Lock the spreads on all games at their current values so late-hour
+        // line moves don't rewrite what players were graded against.
+        for (const g of games) {
+          if (g.spread !== null && g.spread !== undefined && (g.lockedSpread === null || g.lockedSpread === undefined)) {
+            saveGame({ ...g, lockedSpread: g.spread, updatedAt: new Date().toISOString() });
+          }
+        }
+      }
+    }
+
+    // LOCKED → LIVE
+    if ((changed ? next.status : week.status) === WEEK_STATUS.LOCKED && getAutoLiveEnabled(week)) {
+      const liveAt = computeEffectiveLiveAt(week, games);
+      if (liveAt && now >= liveAt.getTime()) {
+        next.status = WEEK_STATUS.LIVE;
+        changed = true;
+      }
+    }
+
+    // LIVE → pending finalization when every game is final (commissioner confirms)
+    if ((changed ? next.status : week.status) === WEEK_STATUS.LIVE && getAutoFinalizeEnabled(week) && !week.pendingFinalization) {
+      const allFinal = games.every(g => g.status === GAME_STATUS.FINAL);
+      if (allFinal) {
+        next.pendingFinalization = true;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      next.updatedAt = new Date().toISOString();
+      saveWeek(next);
+      // Best-effort UI refresh — the picks page and dashboard both depend on
+      // week.status, so re-render whichever is showing.
+      if (state.currentTab === 'picks') renderPicksPage();
+      else if (state.currentTab === 'dashboard') renderDashboard();
+      else if (state.currentTab === 'commissioner') renderCommPage();
+    }
+  } catch (err) {
+    console.warn('[tickAutoTransition] error:', err);
+  }
 }
 
 async function doRefreshScores(week,games) {

@@ -6,12 +6,16 @@
  * Canned-line engine governed by PICKEMS_BOT_VOICE_PROFILE_2.md. No API calls.
  * Voice constraints enforced IN THE POOLS (do not drift):
  *   - deadpan, clinical, chart-note register
- *   - standings = "the chart", picks = "orders", busts = "adverse events",
+ *   - standings = "the chart", picks = "picks", busts = "adverse events",
  *     drink debts = "outstanding balances"
  *   - openers: "SCRIBE NOTE:", "Chart review, gentlemen."  closers: "Filed.", "— SCRIBE"
  *   - profanity rare and surgical (max ONE instance per pool)
  *   - almost no ALL CAPS — restraint is the bit
  *   - savage about football, never about real life
+ *
+ * v0.17.1 vocabulary correction: "orders" is RETIRED. Picks are picks — the
+ * medical-jargon substitution read as strained rather than natural SCRIBE voice.
+ * The rest of the register stands.
  *
  * RATE LIMITS DEFINE THE CHARACTER:
  *   - max 1 SCRIBE message / 10 min in general
@@ -40,11 +44,11 @@ export const SCRIBE_POOLS = {
     'SCRIBE NOTE: the number just changed sides. Adjust your blood pressure accordingly.',
     'Coverage status has flipped. The chart is watching. So should you.',
     'Live update: the spread and the scoreboard have exchanged positions. Documented.',
-    'Mid-game reversal noted. Several orders now in jeopardy. Filed.',
+    'Mid-game reversal noted. Several picks now in jeopardy. Filed.',
     'The cover has changed hands. No further comment at this time.',
   ],
   upsetWatch: [
-    'SCRIBE NOTE: the underdog is not cooperating with your orders, gentlemen.',
+    'SCRIBE NOTE: the underdog is not cooperating with anyone\'s picks, gentlemen.',
     'Upset conditions developing. The chart advises hydration.',
     'The favorite is experiencing complications. Monitoring.',
     'Documented at this time: {TEAM} did not read the number.',
@@ -94,11 +98,11 @@ export const SCRIBE_POOLS = {
     'Per my last note, standing on the chart is earned, not announced. — SCRIBE',
     'This is a learning opportunity, {NAME}.',
   ],
-  buzzerOrders: [
-    'Orders received at the buzzer. Filed.',
-    'SCRIBE NOTE: {NAME} submitted orders with {N} minutes to spare. Documented.',
-    'Late orders noted. The chart does not award style points for urgency.',
-    'Orders in under the wire. This encounter has been documented. — SCRIBE',
+  buzzerPicks: [
+    'Picks received at the buzzer. Filed.',
+    'SCRIBE NOTE: {NAME} filed picks with {N} minutes to spare. Documented.',
+    'Late picks noted. The chart does not award style points for urgency.',
+    'Picks in under the wire. This encounter has been documented. — SCRIBE',
     'Timestamp preserved for the permanent record, {NAME}. It is not flattering.',
     'Received. Reviewed. Filed. Next time, gentlemen, consider daylight.',
   ],
@@ -119,14 +123,14 @@ export const SCRIBE_POOLS = {
     'Documented. The billing department (me) thanks you for your attention to this matter.',
   ],
   unanimous: [
-    'SCRIBE NOTE: unanimous orders detected this week. Historical hit rate of unanimous orders: unfavorable. Filed.',
+    'SCRIBE NOTE: unanimous picks detected this week. Historical hit rate of unanimous picks: unfavorable. Filed.',
     'Second Opinion: the cohort agrees. The cohort has agreed before. Noted for the permanent record.',
-    'Six identical orders received. I will simply leave the all-time record here. — SCRIBE',
+    'Six identical picks received. I will simply leave the all-time record here. — SCRIBE',
     'Unanimity documented. Confidence is not a diagnosis, gentlemen.',
     'The chart notes full consensus. The chart also has a long memory.',
   ],
   loneWolfWin: [
-    'SCRIBE NOTE: lone order on the winning side. {NAME} stands alone, correctly. Filed.',
+    'SCRIBE NOTE: lone pick on the winning side. {NAME} stands alone, correctly. Filed.',
     'One dissent. One cover. The permanent record credits {NAME}. — SCRIBE',
     'Against the cohort, with the spread. Documented with something adjacent to respect, {NAME}.',
     'Adverse event for five. Routine documentation for {NAME}.',

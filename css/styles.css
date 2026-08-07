@@ -1406,3 +1406,60 @@ label[for="week-show-history"],label:has(#week-show-history){
   padding:6px 10px;margin:8px 12px 0;font-size:.72rem;display:flex;justify-content:space-between;gap:8px;align-items:center}
 .chat-sheet-hint button{background:none;border:none;color:var(--maroon);font-weight:700;cursor:pointer;font-size:.72rem}
 .recap-alias{color:var(--text-muted);font-size:.72em;font-style:italic}
+
+/* ── v0.17.1 obligation filter tabs (What I owe / Owed to me) ──────────── */
+.ob-filter-tabs {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  padding-bottom: 8px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.ob-filter-tab {
+  padding: 4px 10px; border-radius: 12px;
+  background: var(--bg-input); color: var(--text-secondary);
+  border: 1px solid var(--border);
+  font-family: 'Oswald', sans-serif; font-size: .72rem; font-weight: 600;
+  letter-spacing: .04em; cursor: pointer;
+  transition: all var(--transition);
+}
+.ob-filter-tab:hover { color: var(--maroon); border-color: var(--maroon-tint); }
+.ob-filter-tab.active { background: var(--maroon); color: #fff; border-color: var(--maroon); }
+.ob-net-me {
+  margin-left: auto; padding: 3px 10px; border-radius: 10px;
+  font-family: 'Oswald', sans-serif; font-size: .72rem; font-weight: 700;
+  background: var(--bg-input); color: var(--text-secondary);
+}
+.ob-net-me.net-positive { background: rgba(26,122,63,.15); color: var(--win); }
+.ob-net-me.net-negative { background: rgba(185,28,28,.15); color: var(--loss); }
+
+/* ── v0.17.1 picks-page timing display (auto-lock / auto-live) ─────────── */
+.picks-timing-info {
+  display: flex; flex-wrap: wrap; gap: 8px 20px;
+  padding: 10px 14px; border-radius: 8px;
+  background: var(--bg-card-alt); border: 1px solid var(--border);
+  font-size: .78rem; color: var(--text-secondary);
+}
+.pt-item { display: inline-flex; align-items: center; gap: 4px; }
+.pt-item strong { color: var(--text-primary); font-weight: 600; }
+.pt-item em { color: var(--maroon); font-style: normal; font-weight: 600; margin-left: 2px; }
+.pt-item.pt-passed { opacity: .55; text-decoration: line-through; }
+
+/* ── v0.17.1 commissioner auto-transition config card ──────────────────── */
+.auto-transition-config {
+  margin: 12px 0; padding: 12px;
+  background: var(--maroon-pale); border: 1px solid var(--maroon-tint);
+  border-radius: 8px;
+}
+.effective-times-preview {
+  margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+  background: var(--bg-input); font-size: .78rem;
+}
+.effective-times-preview div { padding: 2px 0; }
+.effective-times-preview strong { color: var(--maroon); font-weight: 600; }
+
+/* ── v0.17.1 pending-finalization banner ───────────────────────────────── */
+.pending-final-banner {
+  padding: 12px 14px; margin: 12px 0; border-radius: 8px;
+  background: linear-gradient(135deg, #fef3c7, #fde68a);
+  color: #78350f; border: 1px solid #f59e0b;
+  font-size: .88rem; line-height: 1.4;
+}

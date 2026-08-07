@@ -3,8 +3,48 @@
  * No-decision scoring, tiebreaker-aware rankings, season stats by correct picks.
  */
 
-import { PICK_RESULT, GAME_STATUS, getAlmaMaterMatch } from './data-model.js';
+import { PICK_RESULT, GAME_STATUS, getAlmaMaterMatch, getAutoLockOffsetMinutes } from './data-model.js';
 import { getTiebreakerGuess } from './storage.js';
+
+// ─── AUTO-TRANSITION COMPUTE HELPERS ─────────────────────────────────────────
+// These derive the "planned" transition times from the current slate. Read-only
+// — the actual transitions happen in app.js via the auto-refresh tick.
+
+/** First kickoff on the slate, or null if none. Ignores manual games without a kickoff time. */
+export function computeFirstKickoff(games) {
+  const times = (games || [])
+    .map(g => g?.kickoff ? new Date(g.kickoff).getTime() : null)
+    .filter(t => t && !isNaN(t));
+  return times.length ? new Date(Math.min(...times)) : null;
+}
+
+/** Last kickoff on the slate — used for auto-final trigger (all games in must be past). */
+export function computeLastKickoff(games) {
+  const times = (games || [])
+    .map(g => g?.kickoff ? new Date(g.kickoff).getTime() : null)
+    .filter(t => t && !isNaN(t));
+  return times.length ? new Date(Math.max(...times)) : null;
+}
+
+/**
+ * The effective lock time for a week. Rule:
+ *   1. If commissioner explicitly set `picksLockAt`, honor it.
+ *   2. Otherwise, compute: firstKickoff - autoLockOffsetMinutes (default 30).
+ *   3. If no games are on the slate yet, return null (nothing to derive from).
+ */
+export function computeEffectiveLockAt(week, games) {
+  if (!week) return null;
+  if (week.picksLockAt) return new Date(week.picksLockAt);
+  const first = computeFirstKickoff(games);
+  if (!first) return null;
+  const offset = getAutoLockOffsetMinutes(week);
+  return new Date(first.getTime() - offset * 60 * 1000);
+}
+
+/** Effective live time = first kickoff. Auto-live can be disabled. */
+export function computeEffectiveLiveAt(week, games) {
+  return computeFirstKickoff(games);
+}
 
 export function calculateAtsWinner(game) {
   const { homeScore, awayScore, lockedSpread, spread, homeTeam, awayTeam, status } = game;

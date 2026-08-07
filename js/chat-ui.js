@@ -195,12 +195,13 @@ function activeGameTags() {
 function pillsHTML() {
   const self = me();
   const mainUnread = self ? unreadCount(self, 'all') : 0;
-  const mentions = self ? mentionUnreadCount(self) : 0;
   const dot = n => n > 0 ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : '';
+  // v0.17.1: mention inbox removed per commissioner. @mentions still highlight
+  // and still count as notifying events for unread purposes — there's just no
+  // separate filter view for them. The "Locker Room" pill covers all messages.
   let html = `
-    <button class="chat-pill${U.filter === 'all' ? ' active' : ''}" data-chat-filter="all">Room ${dot(mainUnread)}</button>
-    <button class="chat-pill${U.filter === 'records' ? ' active' : ''}" data-chat-filter="records" title="Hall of Records">🏛</button>
-    <button class="chat-pill${U.filter === 'mentions' ? ' active' : ''}" data-chat-filter="mentions" title="Mentions & replies to you">@ ${dot(mentions)}</button>`;
+    <button class="chat-pill${U.filter === 'all' ? ' active' : ''}" data-chat-filter="all">Locker Room ${dot(mainUnread)}</button>
+    <button class="chat-pill${U.filter === 'records' ? ' active' : ''}" data-chat-filter="records" title="Hall of Records">🏛</button>`;
   activeGameTags().forEach(tag => {
     const found = gameById(tag);
     if (!found) return;
@@ -347,7 +348,12 @@ export function renderChatPage() {
 
   let list;
   if (U.filter === 'records') list = getMessages({ tag: 'all', pinned: true });
-  else if (U.filter === 'mentions') list = self ? getMessages({ tag: 'all', mentionsOf: self }) : [];
+  else if (U.filter === 'mentions') {
+    // v0.17.1 — mention inbox removed. If a device has stale state pointing at
+    // 'mentions', treat it as 'all' and fix the filter forward.
+    U.filter = 'all';
+    list = getMessages({ tag: 'all' });
+  }
   else if (U.filter === 'all') list = getMessages({ tag: 'all' });
   else list = getMessages({ tag: U.filter });
 
@@ -374,13 +380,12 @@ export function renderChatPage() {
   if (!stream.length) {
     msgsHTML = `<div class="chat-empty">${U.filter === 'records'
       ? 'The Hall of Records awaits its first entry. Pin a message with 🏛.'
-      : U.filter === 'mentions' ? 'No mentions or replies yet.'
-      : 'The room is open. SCRIBE is on duty.'}</div>`;
+      : 'The Locker Room is open. SCRIBE is on duty.'}</div>`;
   }
 
   // Header context for game views
   let viewHeader = '';
-  if (!['all', 'records', 'mentions'].includes(U.filter)) {
+  if (!['all', 'records'].includes(U.filter)) {
     const found = gameById(U.filter);
     if (found) {
       const g = found.game;
@@ -402,7 +407,7 @@ export function renderChatPage() {
 
   c.innerHTML = `
     <div class="section-header chat-header-row">
-      <div><h2>League Chat</h2><div class="subtitle">${esc(presenceLine)}</div></div>
+      <div><h2>Locker Room</h2><div class="subtitle">${esc(presenceLine)}</div></div>
       <button class="btn btn-ghost btn-sm" id="chat-prefs-btn" title="Chat preferences">⚙️</button>
     </div>
     ${U.prefsOpen ? prefsPanelHTML() : ''}
@@ -448,7 +453,7 @@ function composerHTML() {
       <button id="chat-cancel-reply">✕</button></div>` : ''}
     ${found ? `<div class="chat-tag-chip-row"><span class="chat-tag-chip">🏈 ${esc(gameShort(found.game))}
       <button id="chat-strip-tag" title="Remove game tag — post to the main room only">✕</button></span>
-      <span class="text-muted text-xs">tagged — shows in this game's thread and the room</span></div>` : ''}
+      <span class="text-muted text-xs">tagged — shows in this game's thread and the Locker Room</span></div>` : ''}
     <div class="chat-composer-row">
       <textarea class="chat-input" id="chat-input" rows="1" maxlength="1000"
         placeholder="Message the league…"></textarea>
@@ -495,7 +500,7 @@ function doSend() {
   const gameTag = currentComposerTag();
   const mentions = extractMentions(body);
   sendMessage({ body, gameTag, replyTo: U.replyTo || '', author: self, mentions });
-  // SCRIBE participates as a member — it reads the room, it isn't summoned.
+  // SCRIBE participates as a member — it reads the Locker Room, it isn't summoned.
   try {
     scribeInspectMessage({ author: self, authorName: nameOf(self), body, gameTag, standings: standingsCtx() });
   } catch {}
@@ -741,13 +746,13 @@ export function dashboardChatTeaserHTML() {
   const self = me();
   const n = self ? unreadCount(self, 'all') : 0;
   const latest = latestNotifying(self);
-  const preview = latest ? `<strong>${esc(nameOf(latest.author))}</strong>: ${esc(latest.body.slice(0, 64))}` : 'The room is open.';
+  const preview = latest ? `<strong>${esc(nameOf(latest.author))}</strong>: ${esc(latest.body.slice(0, 64))}` : 'The Locker Room is open.';
   return `
   <div class="card mb-md dash-chat-teaser" id="dash-chat-teaser">
     <div class="dash-chat-left" data-open-chat>
       <span class="dash-chat-icon">💬</span>
       <div>
-        <div class="dash-chat-title">League Chat ${n ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : ''}</div>
+        <div class="dash-chat-title">Locker Room ${n ? `<span class="chat-unread-dot">${n > 99 ? '99+' : n}</span>` : ''}</div>
         <div class="dash-chat-preview">${preview}</div>
       </div>
     </div>

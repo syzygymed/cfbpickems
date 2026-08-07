@@ -366,6 +366,7 @@ export function createPlayer(displayName, email='', pin='0000', almaMater='', in
 
 export function createWeek(season, weekNumber, startDate='', endDate='') {
   // v0.16.0 — weeks carry Ischemic Extra Point fields (enabled/actual/detect)
+  // v0.17.1 — weeks carry auto-transition config (auto-lock/auto-live/auto-final)
   return {
     weekId:`w_${Date.now()}`,
     season, weekNumber,
@@ -375,6 +376,15 @@ export function createWeek(season, weekNumber, startDate='', endDate='') {
     status: WEEK_STATUS.DRAFT,
     dataSourceMode: DATA_SOURCE_MODE.MANUAL,
     picksOpenAt:null, picksLockAt:null,
+    // Auto-transition config. Defaults preserve the previous behavior for
+    // existing weeks (which lacked these fields) — a missing value is read as
+    // the default in the accessor helpers below, so old data still works.
+    // autoLockOffsetMinutes = minutes BEFORE first kickoff to auto-lock.
+    // Commissioner can override picksLockAt to a specific time to bypass.
+    autoLockOffsetMinutes: 30,
+    autoLiveEnabled: true,        // auto-transition LOCKED → LIVE at first kickoff
+    autoFinalizeEnabled: true,    // when all games final, mark ready for final confirm
+    pendingFinalization: false,   // set true when auto-final trigger fires; commissioner confirms
     showInHistory: true,
     blurb:'', recap:'', emailSentAt:null,
     tiebreakerQuestion:'What is the total combined points scored by all alma mater teams on the slate this week?',
@@ -385,6 +395,18 @@ export function createWeek(season, weekNumber, startDate='', endDate='') {
     createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(),
     lockedAt:null, finalizedAt:null,
   };
+}
+
+// Read helpers for auto-transition config with safe defaults for pre-v0.17.1 weeks.
+export function getAutoLockOffsetMinutes(week) {
+  const v = week?.autoLockOffsetMinutes;
+  return Number.isFinite(v) && v >= 0 ? v : 30;
+}
+export function getAutoLiveEnabled(week) {
+  return week?.autoLiveEnabled !== false; // default true
+}
+export function getAutoFinalizeEnabled(week) {
+  return week?.autoFinalizeEnabled !== false; // default true
 }
 
 // ─── ESPN MULTI-SPORT ENDPOINTS ──────────────────────────────────────────────

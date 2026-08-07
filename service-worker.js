@@ -12,7 +12,7 @@
  *   - Bumped CACHE_NAME → cfb-pickems-v15-3 to invalidate any v9 cached files.
  */
 
-const CACHE_NAME = 'cfb-pickems-v17-0';
+const CACHE_NAME = 'cfb-pickems-v17-1';
 
 const STATIC_ASSETS = [
   './',
