@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- UN-96: installed-app home-screen icon source. Full-bleed black square,
+       NO pre-rounded corners — iOS applies its own mask/rounding and
+       double-rounds if we pre-round here. Same inline-emoji technique as the
+       existing favicon.svg (rect + centered <text> emoji), scaled up. This is
+       a static brand asset outside the theme system (CONVENTIONS #13 doesn't
+       apply — same category as manifest.json's background_color). Rasterized
+       to icon-180.png / icon-192.png / icon-512.png; not itself referenced by
+       index.html or manifest.json. -->
+  <rect width="512" height="512" fill="#000000"/>
+  <text x="256" y="368" text-anchor="middle" font-size="320">🏈</text>
+</svg>

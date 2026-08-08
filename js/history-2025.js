@@ -115,7 +115,7 @@ export function season2025Obligations() {
  *
  * BACKWARD COMPATIBILITY, read this before touching it: before this batch the
  * map was BOOLEAN-only (`{ [obligationId]: true }` = paid, absent = unpaid).
- * The debt-approval feature (UN-8x) needs a third state ('pending'), so the
+ * The debt-approval feature (UN-89) needs a third state ('pending'), so the
  * map becomes a status map going forward — but every device that already
  * marked a 2K25 drink paid has a literal `true` sitting in the Sheet right
  * now. A legacy `true` MUST still resolve to 'paid', or those already-settled

@@ -2,12 +2,17 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <!-- UN-100: locks pinch/double-tap zoom for a stable native-app feel on the
+       installed app. Drew knowingly approved the WCAG 1.4.4 tradeoff on
+       2026-08-07 for this private six-person league — do not re-litigate. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#500000" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="CFB Pickems" />
+  <!-- UN-96: iOS reads this for the home-screen label — manifest.json's
+       short_name is already "Pickems"; this brings the two into agreement. -->
+  <meta name="apple-mobile-web-app-title" content="Pickems" />
   <meta name="description" content="Private college football pick'em league tracker" />
   <title>CFB Pickems</title>
   <!-- Stop browsers from serving a stale HTML shell from disk cache. -->
@@ -15,10 +20,15 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <link rel="manifest" href="manifest.json" />
-  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <!-- UN-96: iOS reads apple-touch-icon EXCLUSIVELY for the home-screen icon —
+       it does not consult manifest icons for this. sizes="180x180" is the
+       primary reference; the sizeless fallback below points at the same file
+       for older iOS. -->
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <link rel="icon" type="image/x-icon" href="favicon.ico" />
-  <link rel="stylesheet" href="css/styles.css?v=17-3" />
+  <link rel="stylesheet" href="css/styles.css?v=17-4" />
   <style>
     /* v14.1: Hide app shell until JS is ready so users don't see a flash of the
        maroon header before the PIN gate / dashboard renders. JS removes the
@@ -26,7 +36,10 @@
     body.cfbp-booting .page-wrapper { visibility: hidden; }
   </style>
 </head>
-<body class="cfbp-booting">
+<!-- UN-110: data-tab mirrors app.js navigateTo()'s active tab; set statically
+     here (matching the hardcoded default-active #page-dashboard below) so
+     there's no flash before JS runs navigateTo() for the first time. -->
+<body class="cfbp-booting" data-tab="dashboard">
 
 <!-- v0.16.0: Reveal-page PIN bypass. The CFP 2K26 reveal finale links to
      ?access=scribe — honor it by setting the SAME flag the real PIN gate sets
@@ -48,12 +61,17 @@
 </script>
 
 <!-- Inline theme bootstrap — runs before the module loads so users on a non-default
-     theme don't see a flash of the Aggie palette. Reads settings.theme directly. -->
+     theme don't see a flash of the wrong palette. Reads settings.theme directly.
+     v0.17.4: default corrected 'aggie' -> 'neutral'. This bootstrap disagreed with
+     storage.js getTheme() and app.js applyTheme(), which have both defaulted to
+     'neutral' since v0.17.0 (UN-65, school palettes are opt-in) — so a fresh device
+     flashed Aggie maroon for one frame before JS corrected it. Keep this literal in
+     sync with getTheme()'s fallback; it cannot import. -->
 <script>
   (function () {
     try {
       var s = JSON.parse(localStorage.getItem('cfbp_settings') || '{}');
-      var key = (s && s.theme) || 'aggie';
+      var key = (s && s.theme) || 'neutral';
       document.body.classList.add('theme-' + key);
     } catch (e) { /* fall back to default styles */ }
   })();
@@ -63,15 +81,20 @@
 
   <header class="app-header">
     <div class="app-header-inner">
-      <div class="app-logo">
-        <div class="app-logo-icon">🏈</div>
-        <div class="app-logo-text">CFB <span>Pickems</span></div>
-      </div>
+      <!-- UN-108: #header-meta is the LEFT slot now (was inside .header-right,
+           right-aligned, the bottom item of a 5-row vertical tower). Moved out
+           to balance the header against the identity/sync/tz/theme cluster on
+           the right. Keeps its id — refreshHeader() (js/app.js) targets it by
+           id, so no JS change was needed. -->
+      <div class="header-meta" id="header-meta"><strong>Loading…</strong></div>
       <div class="header-right">
+        <!-- UN-106: identity is the most actionable header state, so it renders
+             first. Empty + hidden until renderHeaderIdentity() (js/app.js) reads
+             getSession() — never a flash of "Sign In" before session resolves. -->
+        <button type="button" id="header-identity" class="header-identity" hidden></button>
         <span id="sync-badge" class="sync-badge"></span>
         <div id="tz-toggle" class="tz-toggle"></div>
         <div id="theme-toggle" class="theme-toggle-slot"></div>
-        <div class="header-meta" id="header-meta"><strong>Loading…</strong></div>
       </div>
     </div>
   </header>
@@ -99,24 +122,31 @@
     </section>
   </main>
 
+  <!-- UN-97: the six bottom-nav icons are the ONE named exception to "icons
+       are unicode emoji" (CLAUDE.md, CONVENTIONS.md #16, approved 2026-08-07).
+       Hand-authored inline SVG, viewBox 0 0 24 24, stroke="currentColor" on
+       one style throughout (outline, not filled — DI explicitly allows
+       either). currentColor + the EXISTING .nav-item.active,.nav-item:active
+       color rule (styles.css:101) themes these across all seven themes with
+       ZERO new color CSS. Do not widen this exception to any other icon. -->
   <nav class="bottom-nav">
     <button class="nav-item" data-tab="picks">
-      <span class="nav-icon">🏈</span><span>Picks</span>
+      <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx="3"/><polyline points="7.5 12.5 10.5 15.5 16.5 8.5"/></svg></span><span>Picks</span>
     </button>
     <button class="nav-item active" data-tab="dashboard">
-      <span class="nav-icon">📊</span><span>Dashboard</span>
+      <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="5" y1="19" x2="5" y2="13"/><line x1="12" y1="19" x2="12" y2="7"/><line x1="19" y1="19" x2="19" y2="10"/></svg></span><span>Dashboard</span>
     </button>
     <button class="nav-item" data-tab="chat">
-      <span class="nav-icon">💬</span><span>Chat</span>
+      <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 5.5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-4 3.5v-3.5H6a2 2 0 0 1-2-2v-9Z"/></svg></span><span>Chat</span>
     </button>
     <button class="nav-item" data-tab="leaderboard">
-      <span class="nav-icon">🏆</span><span>Standings</span>
+      <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M7 4h10v5a5 5 0 0 1-10 0V4Z"/><path d="M5 5H3v2a4 4 0 0 0 4 4.5"/><path d="M19 5h2v2a4 4 0 0 0-4 4.5"/><line x1="12" y1="14" x2="12" y2="18"/><line x1="8" y1="20.5" x2="16" y2="20.5"/><line x1="8" y1="20.5" x2="9" y2="18"/><line x1="16" y1="20.5" x2="15" y2="18"/></svg></span><span>Standings</span>
     </button>
     <button class="nav-item" data-tab="rules">
-      <span class="nav-icon">📋</span><span>Rules</span>
+      <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="5" y="4" width="14" height="17" rx="2"/><rect x="9" y="2.5" width="6" height="3" rx="1"/><line x1="8" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="16" y2="14"/><line x1="8" y1="18" x2="13" y2="18"/></svg></span><span>Rules</span>
     </button>
     <button class="nav-item" data-tab="commissioner">
-      <span class="nav-icon">⚙️</span><span>Comm.</span>
+      <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="22"/><line x1="2" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="22" y2="12"/><line x1="4.8" y1="4.8" x2="6.6" y2="6.6"/><line x1="17.4" y1="17.4" x2="19.2" y2="19.2"/><line x1="4.8" y1="19.2" x2="6.6" y2="17.4"/><line x1="17.4" y1="6.6" x2="19.2" y2="4.8"/></svg></span><span>Comm.</span>
     </button>
   </nav>
 
@@ -125,14 +155,14 @@
 <div id="toast-container"></div>
 
 <!-- Cache-bust the main entry script so a stale browser cache can't serve v9 app.js. -->
-<script type="module" src="js/app.js?v=17-3"></script>
+<script type="module" src="js/app.js?v=17-4"></script>
 <script>
   // Service worker registration + auto-update.
   // When a new SW takes over (e.g. v10 replacing v9), force a one-time reload
   // so the user sees the new code instead of the cached v9 shell.
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('service-worker.js?v=17-3')
+      navigator.serviceWorker.register('service-worker.js?v=17-4')
         .then(reg => {
           console.log('[SW] registered:', reg.scope);
           // If there's already a waiting worker, tell it to activate now.

@@ -178,7 +178,10 @@ export function setAccent(color) { _setPlayerPref('accent', color); }
 export function getChatNick() { return _playerPref('chatNick') || null; }
 export function setChatNick(nick) { _setPlayerPref('chatNick', (nick || '').slice(0, 16)); }
 export function getNotifPrefs() {
-  return { sound: false, toasts: true, systemEvents: true, ...(_playerPref('notif') || {}) };
+  // toastDuration: ms the floating toast stays before auto-removing; 0 means
+  // "Until dismissed" (no auto-remove timer). Default 6000 (CONVENTIONS #10 —
+  // old/absent records must not change behavior until the player opens prefs).
+  return { sound: false, toasts: true, systemEvents: true, toastDuration: 6000, ...(_playerPref('notif') || {}) };
 }
 export function setNotifPrefs(prefs) { _setPlayerPref('notif', { ...getNotifPrefs(), ...prefs }); }
 export function getAccentFor(playerId) {

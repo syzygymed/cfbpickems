@@ -28,7 +28,7 @@ import {
   appendEvents, subscribe, fetchBefore, StaleDeploymentError,
 } from './chatTransport.js';
 import { isBackendConfigured } from './backend.js';
-// v0.17.3 — chat retention (UN-8x) reads settings.chatRetentionDays through
+// v0.17.3 — chat retention (UN-88) reads settings.chatRetentionDays through
 // the storage seam. Safe: storage.js imports only data-model.js + backend.js,
 // neither of which imports chat.js, so this cannot cycle.
 import { getSettings } from './storage.js';
@@ -75,7 +75,7 @@ export function isChatEnabled() {
   return getSettings().chatEnabled !== false;
 }
 
-// ── Chat retention (UN-8x) — CLIENT-SIDE HIDE ONLY ────────────────────────────
+// ── Chat retention (UN-88) — CLIENT-SIDE HIDE ONLY ────────────────────────────
 // Drew's call, not the destructive variant: the backend (backend/Code.gs)
 // exposes only chatAppend/chatSince/chatBefore/chatHead/chatMetrics — no
 // row-removal endpoint — so a real "delete" would need a new endpoint and a
@@ -547,10 +547,23 @@ export function mentionUnreadCount(selfId) {
   return getMessages({ tag: 'all', mentionsOf: selfId }).filter(m => isUnreadFor(m, selfId, ls.seq)).length;
 }
 
+/**
+ * v0.17.4 (UN-102b, batch 2): excludes the viewer's OWN messages, using the
+ * exact `m.author !== selfId` expression `isUnreadFor()` (above) already
+ * applies for the same reason — a message can never notify its own author.
+ * Both callers (the toast in chat-ui.js and the dashboard teaser) want "the
+ * latest thing notifying ME", not "the latest thing, period" — the toast path
+ * already re-derived this filter manually after the call; folding it in here
+ * removes the need for a second, easy-to-forget copy at each call site. Bug
+ * this fixes: the dashboard teaser called this with no author filter, so
+ * sending your own message could resurrect your own dismissed teaser showing
+ * your own text back at you.
+ */
 export function latestNotifying(selfId) {
   let best = null;
   S.items.forEach(m => {
     if (m.type !== 'message' || m.deleted || !m.notify) return;
+    if (m.author === selfId) return;                    // never surface the viewer's own post
     if (isHiddenByRetention(m)) return;                // don't preview a message the reader can't open
     if (!best || orderKey(m) > orderKey(best)) best = m;
   });

@@ -20,9 +20,19 @@
  *      addressed. Live-game observations ride the existing score poll.
  *
  * v0.17.2 — player presence ("N here now") and read receipts ("seen by k") were
- * removed; see the note in chat.js and the amended AD-19. The header subtitle
- * keeps SCRIBE's standing "on duty" framing (UN-67), which was never presence-
- * derived — it was static copy concatenated onto the presence line.
+ * removed; see the note in chat.js and the amended AD-19.
+ *
+ * v0.17.4 (batch 2) — UN-101 marks Chat BETA; UN-102 tightens notifications
+ * (dashboard-tab toast suppression, self-post never resurfaces the teaser, a
+ * "stays for" duration pref, a manual ✕ dismiss); UN-103 removes the composer
+ * emoji row (players use their own keyboard) in favor of a Slack-style + react
+ * on each message, with the rest of `.chat-actions` hidden until a long-press
+ * on touch; UN-104 compacts the chat header into one line, sticks it + the
+ * pills + the per-game view header as ONE unit beneath `.app-header`, and
+ * pins the composer above the bottom nav. The header subtitle that used to
+ * carry SCRIBE's "on duty" framing (UN-67) is gone — that framing survives in
+ * the empty-room state (guarded at §[7a]) and the Rules FAQ in app.js
+ * (guarded at §[23h]).
  *
  * All state lives in chat.js; this module renders and forwards intents.
  */
@@ -47,10 +57,12 @@ import { calculateAtsWinner } from './scoring.js';
 
 export const chatDigest = _digest;
 
-// AD-20 extended to emoji (item G): QUICK_EMOJI is a DERIVED subset of the
-// one shared palette in data-model.js, never an independent literal. The full
-// REACTION_PALETTE is reachable from the composer's "more emoji" picker.
-const QUICK_EMOJI = REACTION_PALETTE.slice(0, 6);
+// v0.17.4 (UN-103): QUICK_EMOJI is RETIRED. The composer no longer inserts
+// emoji at all (players use their own keyboard) and the message-level
+// always-visible 3-button quick-react row is replaced by a single + that
+// opens the full REACTION_PALETTE (data-model.js, AD-20's one shared source)
+// anchored to the message. There is no more "always-visible subset" concept
+// left for QUICK_EMOJI to describe — do not reintroduce it.
 const EDIT_WINDOW_MS = 5 * 60 * 1000;
 const ACCENTS = ['#B91C1C', '#C2410C', '#A16207', '#15803D', '#0E7490', '#1D4ED8', '#7C3AED', '#BE185D'];
 
@@ -71,6 +83,25 @@ const U = {
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ── UN-110 / AD-06 — chat's own sync badge ────────────────────────────────────
+// .app-header (and its #sync-badge) is display:none on the chat tab, so the
+// loud-fail signal needs a second, chat-local home. app.js's updateSyncBadge()
+// is the single writer of truth and calls this on every status change; kept
+// here (not derived from anything DOM-visible) so a FRESH renderChatPage() —
+// which replaces #page-chat's entire innerHTML — can render the current
+// status immediately instead of waiting for the next onBackendStatus event.
+let _lastSyncStatus = null;
+export function setChatSyncStatus(status) { _lastSyncStatus = status; }
+// Exported (test-only, underscore-prefixed per this file's convention — see
+// _syncChatStickyMetrics, _toastWouldSuppress) so loadtest can exercise the
+// real conditional instead of only regex-matching the template source.
+export function _chatSyncBadgeHTML() {
+  // Only 'error' renders — keeps chat chrome minimal in the normal case
+  // while still satisfying the hard loud-fail rule (AD-06).
+  const isError = _lastSyncStatus === 'error';
+  return `<span id="chat-sync-badge" class="sync-badge${isError ? ' sync-error' : ''}">${isError ? '⚠️ Sync error' : ''}</span>`;
 }
 
 /**
@@ -242,12 +273,38 @@ function playBlip() {
   } catch {}
 }
 
+/**
+ * UN-102a: redundancy — while the Dashboard is on screen, the ambient teaser
+ * card (dashboardChatTeaserHTML) already conveys new activity persistently,
+ * so the floating toast is a second copy of the same information ("the
+ * message appears in too many places", Drew). Chat itself keeps its own
+ * pre-existing suppression (chatPageActive) for the same reason — you're
+ * already looking at the room. `force` (system announcements, e.g. the pick
+ * reveal) bypasses BOTH, unchanged from before this batch: those don't ride
+ * the human-message teaser and would otherwise go unseen from the dashboard.
+ *
+ * Exported test-only (see chat.js's `_resetForTest` convention) so the
+ * predicate itself — not a re-implementation of it — gets exercised.
+ */
+export function _toastWouldSuppress(force = false) {
+  return !force && (chatPageActive() || dashboardPageActive());
+}
+
 function showToast(msg, { force = false } = {}) {
   if (!force && !getNotifPrefs().toasts) return;
-  if (chatPageActive() && !force) return;            // suppress while chat focused
+  if (_toastWouldSuppress(force)) return;
   U.toastQueue.push(msg);
   if (!U.toastShowing) drainToast();
 }
+/**
+ * UN-102c: "stays for" duration is player-configurable (3s / 6s default /
+ * 10s / Until dismissed = 0, no auto-remove timer) via getNotifPrefs(). A
+ * manual ✕ is ALWAYS present regardless of duration — Drew: "needs to be
+ * able to be dismissed" — iMessage banners are always manually dismissible
+ * even when they also time out. The ✕ stops propagation so it dismisses
+ * WITHOUT navigating; tapping anywhere else on the toast keeps the existing
+ * dismiss-and-navigate behavior (item d, unchanged).
+ */
 function drainToast() {
   const msg = U.toastQueue.shift();
   if (!msg) { U.toastShowing = false; return; }
@@ -257,10 +314,16 @@ function drainToast() {
   el.id = 'chat-toast';
   el.className = 'chat-toast';
   el.innerHTML = `<span class="chat-toast-avatar" style="${accentOf(msg.author) ? `background:${accentOf(msg.author)};color:#fff` : ''}">${esc(initialsOf(msg.author))}</span>
-    <span class="chat-toast-body"><strong>${esc(nameOf(msg.author))}</strong> ${esc((msg.body || '').slice(0, 80))}</span>`;
-  el.addEventListener('click', () => { el.remove(); U.toastShowing = false; navToChat(); });
+    <span class="chat-toast-body"><strong>${esc(nameOf(msg.author))}</strong> ${esc((msg.body || '').slice(0, 80))}</span>
+    <button type="button" class="chat-toast-dismiss" aria-label="Dismiss">✕</button>`;
+  let autoTimer = null;
+  const advance = () => { clearTimeout(autoTimer); el.remove(); U.toastShowing = false; setTimeout(drainToast, 250); };
+  el.querySelector?.('.chat-toast-dismiss')?.addEventListener('click', e => { e.stopPropagation(); advance(); });
+  el.addEventListener('click', () => { advance(); navToChat(); });
   document.body.appendChild(el);
-  setTimeout(() => { el.remove(); setTimeout(drainToast, 250); }, 6000);
+  const prefMs = getNotifPrefs().toastDuration;
+  const ms = Number.isFinite(prefMs) ? prefMs : 6000;
+  if (ms > 0) autoTimer = setTimeout(advance, ms);   // 0 = "Until dismissed" — no timer, ✕ or tap only
 }
 function navToChat() {
   document.querySelector('.nav-item[data-tab="chat"]')?.click();
@@ -353,7 +416,7 @@ function pillsHTML() {
 }
 
 /**
- * Player-visible retention notice (UN-8x). A player who scrolls back and hits
+ * Player-visible retention notice (UN-88). A player who scrolls back and hits
  * a wall deserves a calm factual explanation, not a mystery — shown to
  * everyone when the commissioner's retention window is ON, absent entirely
  * when it's OFF. Static copy, no user data, nothing to escape.
@@ -457,7 +520,7 @@ function messageHTML(m, self, showNewDivider) {
       <div class="chat-bubble">${m.deleted ? '<span class="chat-tombstone">🪦 message withdrawn</span>' : bodyHTML(m).replace(/\n/g, '<br>')}</div>
       ${reactionsHTML(m, self)}
       ${m.deleted ? '' : `<div class="chat-actions">
-        ${QUICK_EMOJI.slice(0, 3).map(e => `<button class="chat-act" data-react="${e}" data-target="${esc(m.id)}">${e}</button>`).join('')}
+        <button class="chat-act chat-act-react" data-react-open="${esc(m.id)}" title="React">➕</button>
         <button class="chat-act" data-reply="${esc(m.id)}" title="Reply">↩</button>
         ${calloutEligible(m) ? `<button class="chat-act" data-callout="${esc(m.id)}" title="Quote this next to the result">📎</button>` : ''}
         <button class="chat-act" data-pin="${esc(m.id)}" title="${m.pinned ? 'Unpin from' : 'Pin to'} the Hall of Records">${m.pinned ? '📌' : '🏛'}</button>
@@ -499,6 +562,47 @@ function gamereactRunHTML(run) {
   </div>`;
 }
 
+// ── UN-110 (batch 4): composer-height measurement only ───────────────────────
+/**
+ * REVERSES UN-104's header-offset half of this mechanism. `.app-header` is
+ * now `display:none` on the chat tab entirely (`body[data-tab="chat"]
+ * .app-header`, styles.css) — measuring it would return a height of 0 and
+ * publish a permanently-stale `--chat-sticky-top`. That variable and the
+ * calc()-based `.chat-scroll` max-height that read it are BOTH gone; the
+ * header row + pills + view header now dock as an ordinary `flex:0 0 auto`
+ * item at the top of `#page-chat.active`'s real flex column (styles.css) —
+ * flex order does the stacking, no offset math needed at all.
+ *
+ * The composer's own height is still measured — a DIFFERENT, un-asked-for-
+ * but-foreseeable reason survives from UN-104's handoff: "jump to latest"
+ * (`.chat-jump-latest`, styles.css) clears the composer using this same
+ * measured height.
+ */
+let _chatComposerRO = null;
+export function _syncChatStickyMetrics() {
+  if (typeof document === 'undefined') return;
+  const root = document.documentElement;
+  if (!root?.style?.setProperty) return;
+  const composer = document.querySelector('#page-chat .chat-composer');
+  if (composer?.getBoundingClientRect) {
+    const h = Math.ceil(composer.getBoundingClientRect().height);
+    if (h > 0) root.style.setProperty('--chat-composer-h', `${h}px`);
+  }
+}
+function watchChatStickyMetrics() {
+  _syncChatStickyMetrics();
+  if (typeof window === 'undefined' || typeof ResizeObserver !== 'function') return;
+  // .chat-composer is re-created on every renderChatPage() — reattach each time.
+  _chatComposerRO?.disconnect();
+  const composer = document.querySelector('#page-chat .chat-composer');
+  if (composer) { _chatComposerRO = new ResizeObserver(() => _syncChatStickyMetrics()); _chatComposerRO.observe(composer); }
+  if (!window._chatStickyResizeWired) {
+    window._chatStickyResizeWired = true;
+    window.addEventListener('resize', _syncChatStickyMetrics);
+    window.addEventListener('orientationchange', _syncChatStickyMetrics);
+  }
+}
+
 // ── Main chat page ────────────────────────────────────────────────────────────
 export function renderChatPage() {
   const c = document.getElementById('page-chat'); if (!c) return;
@@ -513,7 +617,7 @@ export function renderChatPage() {
   setViewOpen(true);
 
   // respectRetention: true — the rendered stream honors the commissioner's
-  // window (UN-8x). Harmless to pass on the 'records' filter too: pinned
+  // window (UN-88). Harmless to pass on the 'records' filter too: pinned
   // messages are exempt from retention by construction (isHiddenByRetention),
   // so Hall of Records is unaffected either way — passing it everywhere keeps
   // the intent uniform instead of relying on that exemption silently.
@@ -573,24 +677,34 @@ export function renderChatPage() {
     }
   }
 
-  // v0.17.2 — the player-presence prefix ("N here now · ") was removed; SCRIBE's
-  // standing "on duty" framing (UN-67) is static copy and stays.
-  const subtitleLine = '📋 SCRIBE on duty';
-
   const banner = st.offline ? `<div class="chat-offline-banner">⚠️ CHAT OFFLINE — ${st.staleDeployment
     ? 'the backend deployment is out of date. Commissioner: open Apps Script → Deploy → Manage deployments → Edit → <b>New version</b>, then reload.'
     : `messages are not syncing. Retrying… <span class="text-xs">(${esc(st.lastError || '')})</span>`}</div>` : '';
 
+  // UN-104: the two-line header ("Chat" + a "📋 SCRIBE on duty" subtitle) is
+  // gone — Drew asked whether the header needs to be there at all given
+  // limited space; the answer was keep it, but make it unobtrusive. The
+  // SCRIBE "on duty" member-framing requirement (UN-67) survives elsewhere —
+  // the empty-room state above ("SCRIBE is on duty.") and the Rules FAQ — so
+  // dropping it here is a de-duplication, not a loss (loadtest guards both
+  // surviving instances). What replaces it: ONE compact row (Chat + the
+  // UN-101 BETA badge + the gear) wrapped with the pills and the per-game
+  // view header in a single sticky unit docked beneath .app-header, so
+  // there's no per-element `top` math for siblings whose own height also
+  // varies. The offline banner and retention notice stay in NORMAL flow
+  // above that sticky unit, pushing it down rather than floating separately.
   c.innerHTML = `
-    <div class="section-header chat-header-row">
-      <div><h2>Chat</h2><div class="subtitle">${esc(subtitleLine)}</div></div>
-      <button class="btn btn-ghost btn-sm" id="chat-prefs-btn" title="Chat preferences">⚙️</button>
+    ${banner}
+    ${retentionNoticeHTML()}
+    <div class="chat-sticky-stack">
+      <div class="chat-header-row">
+        <h2>Chat <span class="badge badge-beta" title="Still being tested — tell us if something looks wrong">BETA</span> ${_chatSyncBadgeHTML()}</h2>
+        <button class="btn btn-ghost btn-sm" id="chat-prefs-btn" title="Chat preferences">⚙️</button>
+      </div>
+      ${pillsHTML()}
+      ${viewHeader}
     </div>
     ${U.prefsOpen ? prefsPanelHTML() : ''}
-    ${banner}
-    ${pillsHTML()}
-    ${retentionNoticeHTML()}
-    ${viewHeader}
     <div class="chat-scroll" id="chat-scroll">
       ${retentionOn() ? '' : '<button class="chat-load-older" id="chat-load-older">↑ load earlier</button>'}
       ${msgsHTML}
@@ -600,6 +714,7 @@ export function renderChatPage() {
   `;
 
   bindChatPage();
+  watchChatStickyMetrics();
   const scroll = document.getElementById('chat-scroll');
   if (scroll) scroll.scrollTop = scroll.scrollHeight;
 
@@ -676,6 +791,14 @@ export function resumeChatAfterLogin() {
 }
 
 // ── Composer ──────────────────────────────────────────────────────────────────
+/**
+ * UN-103 — Drew: "a user can use their own emojis in their keyboard," so the
+ * composer no longer offers an emoji row at all (neither the six quick-insert
+ * buttons nor the "more emoji" picker). What used to be composer-level emoji
+ * selection is now a per-MESSAGE react (the + in messageHTML's .chat-actions,
+ * opening the same picker anchored to the message instead of the composer).
+ * Composer shape is now: reply chip → tag chip → textarea + send → char count.
+ */
 function composerHTML() {
   const replyMsg = U.replyTo ? getMessage(U.replyTo) : null;
   const tag = currentComposerTag();
@@ -693,7 +816,6 @@ function composerHTML() {
       <button class="chat-send-btn" id="chat-send">➤</button>
     </div>
     <div class="chat-composer-foot">
-      <div class="chat-emoji-row">${QUICK_EMOJI.map(e => `<button class="chat-emoji-insert" data-emoji="${e}">${e}</button>`).join('')}<button type="button" class="chat-emoji-insert chat-emoji-more" id="chat-emoji-more" title="More emoji" aria-label="More emoji">➕</button></div>
       <span class="chat-char-count" id="chat-count" style="display:none"></span>
     </div>
     <div class="chat-mention-menu" id="chat-mention-menu" style="display:none"></div>
@@ -794,6 +916,12 @@ function bindChatPage() {
     toggleReact(b.dataset.target, b.dataset.react, self);
     renderChatPage();
   }));
+  c.querySelectorAll('[data-react-open]').forEach(b => b.addEventListener('click', e => {
+    e.stopPropagation();
+    if (!me()) return;
+    toggleMessageReactPicker(b, b.dataset.reactOpen);
+  }));
+  bindMessageActionsLongPress(document.getElementById('chat-scroll'));
   c.querySelectorAll('[data-reply]').forEach(b => b.addEventListener('click', () => {
     U.replyTo = b.dataset.reply; U.tagStripped = false;
     renderChatPage();
@@ -846,53 +974,136 @@ function bindChatPage() {
   document.getElementById('chat-send')?.addEventListener('click', doSend);
   document.getElementById('chat-cancel-reply')?.addEventListener('click', () => { U.replyTo = null; renderChatPage(); });
   document.getElementById('chat-strip-tag')?.addEventListener('click', () => { U.tagStripped = true; renderChatPage(); });
-  c.querySelectorAll('.chat-emoji-insert:not(.chat-emoji-more)').forEach(b => b.addEventListener('click', () => {
-    const inp = document.getElementById('chat-input');
-    if (inp) { inp.value += b.dataset.emoji; inp.focus(); }
-  }));
-  document.getElementById('chat-emoji-more')?.addEventListener('click', e => {
-    e.stopPropagation();
-    const foot = e.currentTarget.closest('.chat-composer-foot');
-    if (foot) toggleChatEmojiPicker(foot);
-  });
 }
 
 /**
- * Item G — the full REACTION_PALETTE, reachable from the composer via a
- * "more emoji" button. Reuses `.reaction-picker` / `.reaction-pick-option`
- * verbatim (same CSS grid app.js's dashboard reaction picker already solved:
- * 5×3 desktop / 7×3 mobile, 42-44px targets) rather than inventing a second
- * layout — the v0.15.1 picker shipped at ~22×22px and had to be rebuilt once
- * already; don't repeat that.
- *
- * Built/removed via direct DOM node creation (the SAME pattern as app.js's
- * `bindReactionHandlers` "+" picker), not a `renderChatPage()` re-render —
- * a full re-render would wipe any text the player had already typed into the
- * composer (composerHTML() always starts the textarea empty).
+ * UN-103 — per-message react (the + in messageHTML's .chat-actions), Slack-
+ * style rather than composer-level emoji insertion. Reuses `.reaction-picker`
+ * / `.reaction-pick-option` VERBATIM (same CSS grid app.js's dashboard
+ * reaction picker and the old composer picker both used: 5×3 desktop / 7×3
+ * mobile, 42-44px targets) rather than inventing a second layout — the
+ * v0.15.1 picker shipped at ~22×22px and had to be rebuilt once already.
+ * Anchored to the MESSAGE (`.chat-actions`, position:relative in CSS), not
+ * the composer foot — this is a react on that message, not text insertion.
+ * On select, calls the SAME `toggleReact()` the always-visible quick-react
+ * buttons used, then closes.
  */
-function toggleChatEmojiPicker(anchorEl) {
-  const existing = document.getElementById('chat-emoji-picker');
-  if (existing) { existing.remove(); return; }
+function toggleMessageReactPicker(anchorEl, mid) {
+  const existing = document.getElementById('chat-react-picker');
+  const reopening = existing?.dataset?.mid === mid;
+  existing?.remove();
+  if (reopening) return;
+  const self = me(); if (!self) return;
+  const host = anchorEl.closest?.('.chat-actions') || anchorEl;
   const picker = document.createElement('div');
   picker.className = 'reaction-picker';
-  picker.id = 'chat-emoji-picker';
+  picker.id = 'chat-react-picker';
+  picker.dataset.mid = mid;
   picker.innerHTML = REACTION_PALETTE.map(em => `<button type="button" class="reaction-pick-option" data-emoji="${esc(em)}">${em}</button>`).join('');
-  anchorEl.appendChild(picker);
+  host.appendChild(picker);
   picker.querySelectorAll('[data-emoji]').forEach(opt => opt.addEventListener('click', ev => {
     ev.stopPropagation();
-    const inp = document.getElementById('chat-input');
-    if (inp) { inp.value += opt.dataset.emoji; inp.focus(); }
+    toggleReact(mid, opt.dataset.emoji, self);
     picker.remove();
+    renderChatPage();
   }));
   setTimeout(() => {
     const closer = ev => {
-      if (!picker.contains(ev.target) && !ev.target.closest?.('#chat-emoji-more')) {
+      if (!picker.contains(ev.target) && !ev.target.closest?.('[data-react-open]')) {
         picker.remove();
         document.removeEventListener('click', closer);
       }
     };
     document.addEventListener('click', closer);
   }, 0);
+}
+
+// ── UN-103: touch-only long-press to reveal one message's .chat-actions ──────
+/**
+ * `.chat-actions` was permanently semi-visible on every touch device
+ * (`@media(hover:none){.chat-actions{opacity:.75}}`) — "too busy" (Drew).
+ * Desktop's `:hover` reveal (styles.css) is untouched; this ONLY covers
+ * touch, where there's no hover to reveal on.
+ *
+ * Reuses the TIMER + THRESHOLD + cancel-on-move SHAPE proven in app.js's
+ * `bindColumnReorderHandlers` (350ms / 8px — the exact numbers already
+ * separating "long-press intent" from "scroll intent" elsewhere in this
+ * app), delegated on the scroll container so it survives every re-render
+ * without rebinding — same reasoning as `bindFilterButtons`. Deliberately
+ * does NOT reuse the drag/drop-target half of that function: a message
+ * long-press reveals actions in place, it never moves anything.
+ */
+const LONG_PRESS_MS = 350;
+const LONG_PRESS_THRESHOLD_PX = 8;
+let _revealedMsgId = null;
+
+function revealMessageActions(mid) {
+  if (_revealedMsgId && _revealedMsgId !== mid) {
+    document.querySelector(`.chat-msg[data-mid="${_revealedMsgId}"]`)?.classList.remove('chat-actions-revealed');
+  }
+  _revealedMsgId = mid;
+  document.querySelector(`.chat-msg[data-mid="${mid}"]`)?.classList.add('chat-actions-revealed');
+}
+function dismissRevealedActions() {
+  if (!_revealedMsgId) return;
+  document.querySelector(`.chat-msg[data-mid="${_revealedMsgId}"]`)?.classList.remove('chat-actions-revealed');
+  _revealedMsgId = null;
+}
+
+function bindMessageActionsLongPress(root) {
+  if (!root || root._longPressWired) return;
+  root._longPressWired = true;
+  let timer = null, start = null, targetMid = null;
+  root.addEventListener('touchstart', e => {
+    if (e.touches?.length !== 1) return;
+    const msgEl = e.target.closest?.('.chat-msg');
+    if (!msgEl) return;
+    const t = e.touches[0];
+    start = { x: t.clientX, y: t.clientY };
+    targetMid = msgEl.dataset.mid;
+    timer = setTimeout(() => {
+      timer = null;
+      if (targetMid) {
+        revealMessageActions(targetMid);
+        if (navigator.vibrate) try { navigator.vibrate(12); } catch {}
+      }
+    }, LONG_PRESS_MS);
+  }, { passive: true });
+  root.addEventListener('touchmove', e => {
+    // No timer pending (already fired, or never started here) — nothing to cancel.
+    if (!timer || !start) return;
+    const t = e.touches?.[0];
+    if (!t) return;
+    const dx = Math.abs(t.clientX - start.x);
+    const dy = Math.abs(t.clientY - start.y);
+    // A finger swiping to SCROLL crosses this threshold well before 350ms;
+    // a finger holding still to summon actions never does. Cancel the timer
+    // so scrolling over a message never reveals its actions.
+    if (dx + dy > LONG_PRESS_THRESHOLD_PX) {
+      clearTimeout(timer);
+      timer = null;
+      start = null;
+    }
+  }, { passive: true });
+  const clearPress = () => { clearTimeout(timer); timer = null; start = null; };
+  root.addEventListener('touchend', clearPress);
+  root.addEventListener('touchcancel', clearPress);
+}
+// Test-only alias (see chat.js's `_resetForTest` convention) — exercises the
+// REAL bind function's real closures/timing rather than a re-implementation.
+export const _bindMessageActionsLongPress = bindMessageActionsLongPress;
+
+// Dismiss on tap-elsewhere — same document-level closer SHAPE as the reaction
+// pickers above (bind once; a click outside the revealed message clears it).
+let _revealCloserWired = false;
+function wireRevealCloser() {
+  if (_revealCloserWired || typeof document === 'undefined') return;
+  _revealCloserWired = true;
+  document.addEventListener('click', e => {
+    if (!_revealedMsgId) return;
+    if (e.target.closest?.(`.chat-msg[data-mid="${_revealedMsgId}"]`)) return;
+    dismissRevealedActions();
+  });
 }
 
 function maybeMentionMenu(input) {
@@ -926,6 +1137,13 @@ function prefsPanelHTML() {
         `<button class="chat-accent-swatch${a === accent ? ' active' : ''}" data-accent="${a}" style="background:${a}"></button>`).join('')}
         <button class="chat-accent-swatch chat-accent-none${!accent ? ' active' : ''}" data-accent="" title="Default">∅</button></div></div>
     <div class="chat-prefs-row"><label>Toasts</label><input type="checkbox" id="pref-toasts" ${prefs.toasts ? 'checked' : ''}></div>
+    <div class="chat-prefs-row"><label>Stays for</label>
+      <select class="form-input" id="pref-toast-duration">
+        <option value="3000"${prefs.toastDuration === 3000 ? ' selected' : ''}>3s</option>
+        <option value="6000"${prefs.toastDuration == null || prefs.toastDuration === 6000 ? ' selected' : ''}>6s (default)</option>
+        <option value="10000"${prefs.toastDuration === 10000 ? ' selected' : ''}>10s</option>
+        <option value="0"${prefs.toastDuration === 0 ? ' selected' : ''}>Until dismissed</option>
+      </select></div>
     <div class="chat-prefs-row"><label>Sound</label><input type="checkbox" id="pref-sound" ${prefs.sound ? 'checked' : ''}></div>
     <div class="chat-prefs-row"><label>League events</label><input type="checkbox" id="pref-sys" ${prefs.systemEvents ? 'checked' : ''}></div>
   </div>`;
@@ -934,6 +1152,7 @@ function bindPrefsPanel() {
   document.getElementById('pref-nick')?.addEventListener('change', e => { setChatNick(e.target.value); renderChatPage(); });
   document.querySelectorAll('[data-accent]').forEach(b => b.addEventListener('click', () => { setAccent(b.dataset.accent || null); renderChatPage(); }));
   document.getElementById('pref-toasts')?.addEventListener('change', e => setNotifPrefs({ toasts: e.target.checked }));
+  document.getElementById('pref-toast-duration')?.addEventListener('change', e => setNotifPrefs({ toastDuration: Number(e.target.value) }));
   document.getElementById('pref-sound')?.addEventListener('change', e => setNotifPrefs({ sound: e.target.checked }));
   document.getElementById('pref-sys')?.addEventListener('change', e => { setNotifPrefs({ systemEvents: e.target.checked }); renderChatPage(); });
 }
@@ -1046,7 +1265,7 @@ function renderSheetMessages() {
   if (!host || !U.sheetGameId) return;
   const self = me();
   // Retention applies here too — otherwise a player could dodge the window by
-  // opening a game's bottom sheet instead of the main room (UN-8x).
+  // opening a game's bottom sheet instead of the main room (UN-88).
   const list = coalesceStream(getMessages({ tag: U.sheetGameId, respectRetention: true }));
   host.innerHTML = list.length
     ? list.map(item => item.kind === 'gamereact-run' ? gamereactRunHTML(item) : messageHTML(item, self, false)).join('')
@@ -1297,6 +1516,7 @@ function maybeAnniversary() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 export function initChatUI() {
   initChat(me());
+  wireRevealCloser();
 
   onChat((kind, detail) => {
     if (kind === 'events') {

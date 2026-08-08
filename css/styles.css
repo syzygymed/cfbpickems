@@ -86,18 +86,25 @@ h4{font-size:.9rem;text-transform:uppercase;letter-spacing:.08em}
 .section-header{padding:20px 0 12px;border-bottom:2px solid var(--maroon-tint);margin-bottom:16px}
 .section-header h2{color:var(--maroon)}.section-header .subtitle{color:var(--text-muted);font-size:.875rem;margin-top:2px}
 /* Header */
-.app-header{background:var(--maroon);border-bottom:3px solid var(--gold);position:sticky;top:0;z-index:100;box-shadow:0 2px 12px rgba(80,0,0,.25)}
+/* UN-98: on the installed app, viewport-fit=cover + a translucent status bar
+   (index.html) make safe-area insets non-zero and draw the app UNDER the
+   status bar / Dynamic Island. Mirrors the .bottom-nav pattern already proven
+   at styles.css:98,313 — env() with a 0px fallback so a Safari tab (inset 0)
+   is unaffected. */
+.app-header{background:var(--maroon);border-bottom:3px solid var(--gold);position:sticky;top:0;z-index:100;box-shadow:0 2px 12px rgba(80,0,0,.25);padding-top:env(safe-area-inset-top,0px)}
 .app-header-inner{max-width:var(--max-width);margin:0 auto;padding:12px var(--page-pad);display:flex;align-items:center;justify-content:space-between;gap:12px}
-.app-logo{display:flex;align-items:center;gap:10px}
-.app-logo-icon{width:36px;height:36px;background:var(--gold);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:20px}
-.app-logo-text{font-family:'Oswald',sans-serif;font-size:1.3rem;font-weight:700;color:#fff;letter-spacing:.06em}
-.app-logo-text span{color:var(--gold-light)}
-.header-meta{text-align:right;font-size:.75rem;color:rgba(255,255,255,.75);line-height:1.4}
+/* UN-108: header-meta is the LEFT slot (week label + status badge) now that
+   UN-109 removed the app-logo block that used to occupy it. */
+.header-meta{text-align:left;font-size:.75rem;color:rgba(255,255,255,.75);line-height:1.4}
 .header-meta strong{color:#fff;display:block;font-size:.82rem;font-family:'Oswald',sans-serif}
 /* Nav */
 .bottom-nav{position:fixed;bottom:0;left:0;right:0;height:var(--nav-height);background:#fff;border-top:1px solid var(--border);display:flex;z-index:100;box-shadow:0 -2px 12px rgba(0,0,0,.06);padding-bottom:env(safe-area-inset-bottom,0px)}
 .nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;color:var(--text-muted);font-size:.62rem;font-family:'Inter',sans-serif;font-weight:600;letter-spacing:.04em;text-transform:uppercase;transition:color var(--transition);border:none;background:none;padding:6px 4px;min-height:44px;-webkit-tap-highlight-color:transparent}
 .nav-item .nav-icon{font-size:1.25rem;line-height:1}
+/* UN-97: inline SVG sized to the ~20px footprint the emoji it replaced had
+   (.nav-icon's 1.25rem font-size at the default 16px root). No color rule
+   here — currentColor inherits `color` from .nav-item / .nav-item.active. */
+.nav-icon svg{width:20px;height:20px;display:block}
 .nav-item.active,.nav-item:active{color:var(--maroon)}
 /* Cards */
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--card-radius);padding:16px;box-shadow:var(--shadow-card)}
@@ -171,6 +178,12 @@ h4{font-size:.9rem;text-transform:uppercase;letter-spacing:.08em}
 /* Badges */
 .badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:.68rem;font-weight:700;font-family:'Oswald',sans-serif;text-transform:uppercase;letter-spacing:.05em}
 .badge-draft{background:#F5F3EE;color:var(--text-muted);border:1px solid var(--border)}
+/* UN-101: chat is still being tested. Same variables .badge-draft uses
+   (--text-muted/--border) — background reuses the theme var closest to
+   .badge-draft's hardcoded fill instead of adding a new hardcoded color
+   (CONVENTIONS #13). No animation — chat surfaces use the static variant
+   (locked, v0.17.2, same rule that keeps thread-header colors static). */
+.badge-beta{background:var(--bg-input);color:var(--text-muted);border:1px solid var(--border)}
 .badge-open{background:var(--win-bg);color:var(--win);border:1px solid rgba(26,122,63,.3)}
 .badge-locked{background:var(--maroon-pale);color:var(--maroon);border:1px solid var(--maroon-tint)}
 .badge-live{background:var(--live-bg);color:var(--live);border:1px solid rgba(220,38,38,.3);animation:pulse 1.5s infinite}
@@ -245,6 +258,38 @@ h4{font-size:.9rem;text-transform:uppercase;letter-spacing:.08em}
 .player-name-cell{font-weight:600;color:var(--text-primary)}
 .points-cell{font-family:'Oswald',sans-serif;font-size:1.1rem;font-weight:700;color:var(--maroon);text-align:right}
 .winner-row td{background:rgba(192,155,58,.06)}.loser-row td{background:rgba(185,28,28,.04)}
+/* UN-105a — horizontal-scroll edge-fade cue. ONE shared class applied to
+   every wide-table wrapper (.dashboard-scroll here + .batch-grid-scroll
+   below) by the ONE shared binder (initScrollFades in app.js). Both edges
+   default to opacity:0 — .scroll-fade-active (set only when the container
+   genuinely overflows) is required before either can show at all, so a
+   table that already fits on-screen never hints at a scroll that doesn't
+   exist. .scroll-fade-at-end hides the right fade once fully scrolled right;
+   .scroll-fade-scrolled reveals the left fade once scrolled away from the
+   start — both toggled by the same scroll listener, never a static gradient. */
+/* v0.17.4 (caught in review): the first version positioned these pseudo-elements
+   absolutely INSIDE the overflow-x:auto element, so they scrolled away with the
+   content — measured drifting to mid-table, and the left cue could never be seen
+   at all because it had already scrolled off by the time it switched on.
+
+   background-attachment:local is purpose-built for exactly this. The two `local`
+   layers are painted relative to the CONTENT and cover the gradients at the
+   respective ends; the two `scroll` gradient layers are painted relative to the
+   SCROLLPORT and so stay pinned at the edges. The result: each fade shows only
+   when there is more content that way, hides itself at the boundary, and shows
+   nothing at all when the content fits — with no JS and nothing to drift. */
+.scroll-fade{
+  background-image:
+    linear-gradient(to right, var(--bg-card), transparent),
+    linear-gradient(to left,  var(--bg-card), transparent),
+    linear-gradient(to right, rgba(0,0,0,.13), transparent),
+    linear-gradient(to left,  rgba(0,0,0,.13), transparent);
+  background-position: left center, right center, left center, right center;
+  background-repeat: no-repeat;
+  background-size: 28px 100%, 28px 100%, 14px 100%, 14px 100%;
+  background-attachment: local, local, scroll, scroll;
+}
+
 /* Dashboard table */
 .dashboard-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:var(--card-radius);border:1px solid var(--border)}
 .dashboard-table{width:100%;border-collapse:collapse;min-width:420px}
@@ -275,7 +320,10 @@ h4{font-size:.9rem;text-transform:uppercase;letter-spacing:.08em}
 .refresh-btn-mini{background:none;border:1px solid var(--border);color:var(--text-muted);cursor:pointer;font-size:.75rem;padding:4px 10px;border-radius:6px;display:flex;align-items:center;gap:4px;transition:all var(--transition)}
 .refresh-btn-mini:hover{border-color:var(--maroon);color:var(--maroon)}
 /* Toast */
-#toast-container{position:fixed;top:76px;right:16px;left:16px;z-index:1000;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:420px;margin:0 auto}
+/* UN-98 coupled change: once .app-header can grow taller in standalone (safe
+   area padding above), a flat 76px no longer clears it — grow with the same
+   inset so the toast never lands under the new taller header. */
+#toast-container{position:fixed;top:calc(76px + env(safe-area-inset-top,0px));right:16px;left:16px;z-index:1000;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:420px;margin:0 auto}
 .toast{background:#fff;border:1.5px solid var(--border);border-radius:var(--card-radius);padding:12px 16px;display:flex;align-items:center;gap:10px;box-shadow:0 4px 20px rgba(0,0,0,.12);animation:toast-in .25s ease;pointer-events:all;font-size:.9rem;color:var(--text-primary)}
 .toast.success{border-color:var(--win)}.toast.error{border-color:var(--loss)}.toast.warning{border-color:var(--gold)}
 @keyframes toast-in{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
@@ -317,7 +365,52 @@ h4{font-size:.9rem;text-transform:uppercase;letter-spacing:.08em}
 /* ── v7 ADDITIONS ─────────────────────────────────────────────────────────── */
 
 /* Timezone toggle in header */
-.header-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+/* UN-108, root cause verified: this was flex-direction:column — a five-row
+   vertical tower (identity, sync badge, tz, theme, header-meta) stacked
+   against a single small logo on the left. THAT was the literal mechanism
+   behind "unbalanced," not a spacing nit. header-meta moved out to become
+   its own left slot (above); row + wrap here is the other half of the fix —
+   .app-header-inner's existing justify-content:space-between now creates a
+   real left/right split instead of lopsided/tall vs. flat/wide. */
+.header-right{display:flex;flex-direction:row;align-items:center;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+
+/* UN-111: tz/theme are global settings, not something every screen needs.
+   Hidden everywhere by default; shown only on the tabs where they're either
+   actionable (picks/dashboard, the default landing surfaces) or load-bearing
+   (commissioner — kickoff times render in Comm -> Games, app.js:3017,3239,3286,
+   and there is no admin-scoped tz control there, so dropping tz on that tab
+   would strand a commissioner mid-slate-review; theme has no page-content
+   dependency, so it stays literal to Drew's words and skips Comm). Tab keys
+   MUST match the nav's real data-tab values (index.html) — "leaderboard", not
+   "standings", is the one naming trap here. Visibility only; both controls
+   stay reachable from Dashboard, the default landing tab, so neither is
+   orphaned. */
+#tz-toggle,#theme-toggle{display:none}
+body[data-tab="picks"] #tz-toggle,
+body[data-tab="dashboard"] #tz-toggle,
+body[data-tab="commissioner"] #tz-toggle{display:flex}
+body[data-tab="picks"] #theme-toggle,
+body[data-tab="dashboard"] #theme-toggle{display:inline-flex}
+
+/* UN-110: chat owns the screen — REVERSES UN-104's same-day "keep the header,
+   make it unobtrusive" answer. See the #page-chat.active flex-column block
+   (chat page section, below) for the layout this enables. */
+body[data-tab="chat"] .app-header{display:none}
+
+/* UN-106: signed-in indicator / low-friction sign-in CTA. One element serves
+   BOTH states so it adds no net clutter to an already-crowded header. Padding
+   gives a >=40x40 tap target (CONVENTIONS #17) even though the visible avatar
+   is smaller, same "pad the wrapper" technique as .nav-item. */
+.header-identity{display:flex;align-items:center;gap:6px;background:none;border:none;cursor:pointer;
+  padding:8px 4px;min-height:40px;min-width:40px;-webkit-tap-highlight-color:transparent}
+.header-identity[hidden]{display:none}
+.header-identity-avatar{width:27px;height:27px;border-radius:50%;background:var(--gold);color:var(--maroon);
+  display:inline-flex;align-items:center;justify-content:center;font-family:'Oswald',sans-serif;
+  font-size:.68rem;font-weight:700;flex-shrink:0}
+.header-identity-name{color:#fff;font-family:'Oswald',sans-serif;font-size:.8rem;font-weight:600}
+.header-identity-pill{background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.4);color:#fff;
+  font-family:'Oswald',sans-serif;font-size:.72rem;font-weight:700;letter-spacing:.03em;
+  padding:4px 12px;border-radius:20px}
 .tz-toggle{display:flex;gap:2px}
 .tz-btn{background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.25);color:rgba(255,255,255,.7);font-family:'Oswald',sans-serif;font-size:.62rem;font-weight:700;letter-spacing:.04em;padding:3px 7px;border-radius:6px;cursor:pointer;transition:all .15s}
 .tz-btn.active,.tz-btn:hover{background:var(--gold);color:#1C1410;border-color:var(--gold)}
@@ -648,11 +741,10 @@ label[for="week-show-history"],label:has(#week-show-history){
 @media (max-width: 480px) {
   :root { --page-pad: 14px; }
   .app-header-inner { gap: 8px; padding: 10px var(--page-pad); }
-  .app-logo-text { font-size: 1.05rem; }
-  .app-logo-icon { width: 30px; height: 30px; font-size: 17px; }
-  /* Header right-side: PT/MT/CT/ET + theme dropdown + sync badge + meta were
-     fighting for horizontal space. Allow them to wrap onto a second line on
-     phones; on desktop they stay inline. */
+  /* Header right-side: PT/MT/CT/ET + theme dropdown + sync badge were
+     fighting for horizontal space (UN-108 moved header-meta out to its own
+     left slot, but the right cluster can still wrap on its own). Allow them
+     to wrap onto a second line on phones; on desktop they stay inline. */
   .header-right { flex-wrap: wrap; justify-content: flex-end; gap: 6px; row-gap: 4px; }
   .header-meta { font-size: .65rem; }
   /* Pick buttons: thumb-friendly without overflowing. */
@@ -665,13 +757,17 @@ label[for="week-show-history"],label:has(#week-show-history){
   .pin-input, .email-input { width: 100%; }
   /* Available-games filter bar: each control on its own line. */
   .avail-filter-label { min-width: 100%; }
-  /* Toasts: edge-to-edge with consistent inset. */
-  #toast-container { left: 8px; right: 8px; top: 70px; }
+  /* Toasts: edge-to-edge with consistent inset. Same UN-98 coupled fix as the
+     base rule above — this override sits in a <=480px media query that
+     matches virtually every phone, so without the env() term here the base
+     rule's fix would be completely masked on the real devices it targets. */
+  #toast-container { left: 8px; right: 8px; top: calc(70px + env(safe-area-inset-top,0px)); }
   /* Section cards: tighter inner padding. */
   .card { padding: 12px; }
   /* Bottom nav: trim font so 5 tabs fit comfortably. */
   .nav-item { font-size: .62rem; }
   .nav-icon { font-size: 1.1rem; }
+  .nav-icon svg { width: 18px; height: 18px; }
   /* Sync stats — go single-column. */
   .sync-stats { grid-template-columns: 1fr; }
 }
@@ -679,8 +775,12 @@ label[for="week-show-history"],label:has(#week-show-history){
 /* Very narrow (under 360px — older iPhone SE / mini) */
 @media (max-width: 360px) {
   :root { --page-pad: 10px; }
-  .app-logo-text { font-size: .95rem; }
-  .header-meta { display: none; }
+  /* UN-108 follow-through: header-meta used to be hidden here because it was
+     the LAST, lowest-priority item crammed into the right-side tower. It is
+     now the header's LEFT slot (week label + status badge) — hiding it would
+     leave that side empty and undo the balance fix on exactly the narrowest
+     devices. Left visible; .header-meta{font-size:.65rem} from the <=480px
+     tier above still applies. */
   .nav-item span:last-child { font-size: .58rem; }
 }
 
@@ -744,6 +844,12 @@ label[for="week-show-history"],label:has(#week-show-history){
 .reaction-picker{position:absolute;top:100%;left:0;margin-top:4px;background:var(--bg-card);
   border:1px solid var(--border);border-radius:8px;padding:4px;display:flex;gap:2px;
   box-shadow:var(--shadow-card);z-index:50}
+/* v0.17.4 (caught in review): the composer-scoped rule that fixed this was
+   deleted along with the composer picker, and no equivalent was written for the
+   new per-message anchor. A picker at top:100% on the newest message — bottom
+   of the screen, the common case — opened underneath .bottom-nav (z-index 100)
+   and the user saw nothing happen. Open upward from a message, and clear the nav. */
+.chat-msg .reaction-picker{top:auto;bottom:100%;margin:0 0 4px;z-index:150}
 .reaction-pick-option{background:transparent;border:none;cursor:pointer;font-size:1.1rem;padding:4px 6px;
   border-radius:6px;line-height:1;transition:background var(--transition)}
 .reaction-pick-option:hover{background:var(--bg-input)}
@@ -805,11 +911,21 @@ label[for="week-show-history"],label:has(#week-show-history){
 @media (max-width: 480px) { .spread-input-row{grid-template-columns:1fr} }
 
 /* ── v15.1: Persistent backend-error banner (loud-fail) ────────────────────────
-   Sticks to the top of the viewport whenever cross-device sync is broken so
-   players and the commissioner can SEE that their submissions might not be
-   reaching the league. Dismissable but not auto-hidden. Replaced by a new
-   message in place if multiple errors fire. */
-.backend-error-banner{position:sticky;top:0;left:0;right:0;z-index:200;
+   Whenever cross-device sync is broken, players and the commissioner must SEE
+   that their submissions might not be reaching the league. Dismissable but
+   not auto-hidden. Replaced by a new message in place if multiple errors fire.
+   Regression fix (batch 4, v0.17.5) — AD-06 violation: showBackendErrorBanner()
+   (js/app.js) does document.body.appendChild(el), which appends AFTER
+   .page-wrapper closes. position:sticky sticks relative to the element's OWN
+   flow position, which was below the entire app — on any page taller than one
+   viewport a player had to scroll past all content to ever see it. CLAUDE.md
+   and AD-06 both describe "a persistent red banner on every screen"; it had
+   not been that. Fixed to position:fixed (correct for a body-level element
+   that isn't part of any scrolling flow) + env(safe-area-inset-top) so it
+   clears the status bar on the installed app, same pattern as .app-header
+   (UN-98). */
+.backend-error-banner{position:fixed;top:0;left:0;right:0;z-index:200;
+  padding-top:env(safe-area-inset-top,0px);
   background:#7c1010;color:#fff;font-family:'Inter',sans-serif;border-bottom:3px solid #4a0808;
   box-shadow:0 2px 8px rgba(0,0,0,.25)}
 .beb-inner{max-width:var(--max-width);margin:0 auto;display:flex;align-items:flex-start;gap:10px;
@@ -1237,9 +1353,21 @@ label[for="week-show-history"],label:has(#week-show-history){
 .faq-lifecycle{display:flex;flex-direction:column;gap:10px;margin-top:6px}
 .faq-stage{display:flex;gap:10px;align-items:flex-start;font-size:.83rem}
 .faq-stage .badge{flex:0 0 auto;margin-top:2px}
-.faq-perms{width:100%;border-collapse:collapse;font-size:.78rem;margin-top:6px}
-.faq-perms th,.faq-perms td{padding:6px 6px;border-bottom:1px solid var(--bg-input);text-align:left;vertical-align:top}
-.faq-perms th:nth-child(2),.faq-perms th:nth-child(3),.faq-perms td:nth-child(2),.faq-perms td:nth-child(3){text-align:center;white-space:nowrap}
+/* UN-105b — table-layout:fixed with explicit column widths so all three
+   columns actually fit (this table has no scroll wrapper, unlike
+   .dashboard-scroll — the goal is to FIT, not to scroll). The former
+   white-space:nowrap on cols 2/3 forced full sentences onto one line, which
+   overflowed and was silently clipped by .main-content{overflow-x:hidden}.
+   Left-align (the table default, no per-column override needed) instead of
+   center — with a fixed column width, left-align pins the leading emoji to
+   the same x-position on every row, which is what fixes the "emoji not in a
+   straight column" complaint; center-align drifts with each cell's text
+   length. */
+.faq-perms{width:100%;border-collapse:collapse;font-size:.78rem;margin-top:6px;table-layout:fixed}
+.faq-perms th,.faq-perms td{padding:6px 6px;border-bottom:1px solid var(--bg-input);text-align:left;vertical-align:top;word-wrap:break-word}
+.faq-perms th:nth-child(1),.faq-perms td:nth-child(1){width:46%}
+.faq-perms th:nth-child(2),.faq-perms td:nth-child(2){width:27%}
+.faq-perms th:nth-child(3),.faq-perms td:nth-child(3){width:27%}
 .faq-perms thead th{color:var(--maroon);font-family:'Oswald',sans-serif}
 
 /* ── Chat: nav badge ── */
@@ -1258,7 +1386,54 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-pill.active{background:var(--maroon);border-color:var(--maroon);color:#fff}
 .chat-unread-dot{background:#D62828;color:#fff;font-size:.6rem;font-weight:700;border-radius:9px;min-width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;padding:0 4px}
 .chat-pill.active .chat-unread-dot{background:#fff;color:var(--maroon)}
-.chat-scroll{background:var(--bg-card);border-radius:var(--card-radius);padding:10px;max-height:56vh;overflow-y:auto;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+/* UN-110 (batch 4, v0.17.5) — REVERSES UN-104's SAME-DAY "keep the header,
+   make it unobtrusive" answer. Authoritative; do not re-litigate (see the
+   ledger's UN-110 row). Drew: chat should take up the majority of the visible
+   space "just like a chat window in any messaging app," so the header is
+   removed on this tab entirely (`body[data-tab="chat"] .app-header`, near
+   the top of this file with the rest of the header rules).
+
+   This REPLACES UN-104's mechanism outright, not a patch on top of it: once
+   the header is display:none, `_syncChatStickyMetrics()` (chat-ui.js)
+   measuring it returns 0, and the calc()-based max-height that used to read
+   `--chat-sticky-top` would be permanently wrong. `#page-chat.active` is a
+   real flex column instead, with an explicit bounded height — the header row
+   + pills + view header, the offline banner, the retention notice, and the
+   composer are all ordinary `flex:0 0 auto` items; `.chat-scroll` is the ONE
+   `flex:1 1 auto` child that actually scrolls.
+
+   Why this survives the trap that killed UN-104's first attempt (v0.17.4:
+   position:sticky was inert because `.page-wrapper`/`.main-content` both set
+   overflow-x:hidden, which makes overflow-y compute to `auto`, making THEM
+   the nearest scrolling ancestor instead of the viewport): this uses NO
+   position:sticky anywhere. Flex distribution and a bounded overflow:auto
+   child are unaffected by an ancestor's overflow-x:hidden. */
+#page-chat.active{display:flex;flex-direction:column;
+  height:calc(100dvh - var(--nav-height) - env(safe-area-inset-bottom,0px));
+  padding-top:env(safe-area-inset-top,0px);
+  overflow:hidden}
+@supports not (height:100dvh){#page-chat.active{height:calc(100vh - var(--nav-height) - env(safe-area-inset-bottom,0px))}}
+/* Consequence of the above, not itself spelled out in the design input
+   (flagged here, same as the --chat-composer-h "jump to latest" fix was
+   flagged in UN-104's handoff): .main-content's generic padding-bottom
+   (calc(nav-height + safe-area-inset-bottom + 20px), base rule + the
+   @supports override near the top of this file) exists so pages that scroll
+   as a normal document clear the FIXED .bottom-nav. #page-chat.active already
+   subtracts nav-height + the safe-area inset from its own explicit height, so
+   without this override .main-content would demand ~20px MORE height than the
+   viewport actually has (double-counting the nav clearance), forcing the
+   whole page to scroll on chat and defeating "no scroll needed to see the
+   composer." Higher specificity (0,2,1) wins over both the base rule and its
+   @supports override regardless of source order or feature support. */
+body[data-tab="chat"] .main-content{padding-bottom:0}
+.chat-sticky-stack,.chat-offline-banner,.chat-retention-notice,.chat-composer,#chat-jump{flex:0 0 auto}
+/* min-height:0 is REQUIRED — a flex child will not shrink or scroll without
+   it (the flex default min-height is `auto`, i.e. "at least as tall as my
+   content"). Omitting it produces a page that looks fine until the thread is
+   long enough to push the composer off-screen. Classic flex-scroll bug. */
+.chat-scroll{background:var(--bg-card);border-radius:var(--card-radius);padding:10px;box-shadow:0 1px 3px rgba(0,0,0,.06);
+  overflow-y:auto;-webkit-overflow-scrolling:touch;
+  flex:1 1 auto;min-height:0;max-height:none}
 .chat-load-older{display:block;margin:0 auto 8px;background:var(--bg-input);border:none;border-radius:999px;padding:4px 12px;font-size:.7rem;color:var(--text-secondary);cursor:pointer}
 .chat-day-sep{text-align:center;font-size:.65rem;color:var(--text-muted);letter-spacing:.06em;text-transform:uppercase;margin:12px 0 6px}
 .chat-empty{text-align:center;color:var(--text-secondary);padding:28px 0;font-size:.9rem}
@@ -1292,35 +1467,51 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-reactions{display:flex;gap:4px;margin-top:3px;flex-wrap:wrap}
 .chat-react-pill{background:var(--bg-card-alt);border:1px solid var(--bg-input);border-radius:999px;padding:1px 7px;font-size:.7rem;cursor:pointer}
 .chat-react-pill.me{border-color:var(--maroon);background:var(--maroon-pale)}
-.chat-actions{display:flex;gap:2px;margin-top:2px;opacity:0;transition:opacity .15s}
-.chat-msg:hover .chat-actions,.chat-msg:focus-within .chat-actions{opacity:1}
-@media (hover:none){.chat-actions{opacity:.75}}
-.chat-act{background:none;border:none;font-size:.78rem;cursor:pointer;padding:2px 4px;border-radius:6px}
+/* position:relative anchors the UN-103 per-message react picker
+   (.reaction-picker), appended as a child of .chat-actions. */
+/* v0.17.4 (caught in review): opacity:0 alone left a 40px-tall strip of LIVE
+   controls under every message on touch. 🏛 pin and 📎 callout fire with no
+   confirmation, so a stray tap could publish someone's message to the Hall of
+   Records. Hidden must mean untappable. */
+.chat-actions{display:flex;gap:4px;margin-top:2px;opacity:0;pointer-events:none;transition:opacity .15s;position:relative}
+/* Desktop — UNCHANGED by UN-103 (Drew: "desktop needs zero changes"). Matches
+   Slack/Discord convention already. */
+.chat-msg:hover .chat-actions,.chat-msg:focus-within .chat-actions{opacity:1;pointer-events:auto}
+/* UN-103: touch previously left this permanently semi-visible
+   (opacity:.75 on every message, every screen) — "too busy" (Drew). Touch now
+   starts hidden like desktop and reveals ONE message's actions via a
+   long-press (bindMessageActionsLongPress, chat-ui.js), which adds
+   .chat-actions-revealed to that message only. */
+@media (hover:none){.chat-msg.chat-actions-revealed .chat-actions{opacity:1;pointer-events:auto}}
+/* CONVENTIONS #17 — was padding:2px 4px, well under the 40px tap-target
+   floor. Bumped now that this row is reachable by touch at all. */
+.chat-act{background:none;border:none;font-size:.85rem;cursor:pointer;border-radius:8px;padding:0;min-width:40px;min-height:40px;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box}
 .chat-act:hover{background:var(--bg-input)}
 .chat-game-chip{background:var(--maroon-pale);border:none;border-radius:6px;padding:1px 7px;font-size:.62rem;font-weight:600;color:var(--maroon);cursor:pointer}
 
 /* composer */
 .chat-composer{margin-top:10px;background:var(--bg-card);border-radius:var(--card-radius);padding:8px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+/* UN-104 wanted #page-chat's OWN composer (not the bottom-sheet's, which also
+   uses .chat-composer but lives outside #page-chat under #chat-sheet-wrap) to
+   stay pinned above the bottom nav instead of scrolling away at the bottom of
+   the page. v0.17.4 tried position:sticky here and found it INERT —
+   .page-wrapper and .main-content both set overflow-x:hidden, so overflow-y
+   computes to auto, they become the nearest scrolling ancestor, and they
+   never scroll — so that rule was removed rather than left for someone to
+   "fix" a rule that was never applying.
+   UN-110 (batch 4) actually delivers the original pin, via a different
+   mechanism: the composer is now an ordinary `flex:0 0 auto` item in
+   `#page-chat.active`'s bounded flex column (see that block, above) — it
+   sits at a fixed position in the viewport for free, no position:sticky
+   needed, because `.chat-scroll` is the only child that scrolls. */
 .chat-composer-row{display:flex;gap:8px;align-items:flex-end}
 .chat-input{flex:1;border:1px solid var(--bg-input);background:var(--bg-input);border-radius:12px;padding:9px 12px;font-size:.9rem;font-family:inherit;resize:none;max-height:120px}
 .chat-input:focus{outline:2px solid var(--maroon-light)}
 .chat-send-btn{flex:0 0 40px;width:40px;height:40px;border-radius:50%;border:none;background:var(--maroon);color:#fff;font-size:1rem;cursor:pointer}
-/* position:relative anchors the item G "more emoji" picker (.reaction-picker,
-   reused verbatim from the dashboard's game-reaction picker), which is
-   position:absolute;top:100%;left:0 relative to this row. */
-.chat-composer-foot{display:flex;justify-content:space-between;align-items:center;margin-top:4px;position:relative}
-.chat-emoji-row{display:flex;gap:2px;align-items:center}
-.chat-emoji-insert{background:none;border:none;font-size:1rem;cursor:pointer;padding:2px}
-/* v0.17.3 (caught in review): this inherited .chat-emoji-insert's padding:2px
-   and shrank the font, landing at roughly an 18px tap target against the 40px
-   floor (CONVENTIONS #17). Same class of miss as the .chat-pill fix in v0.17.2. */
-.chat-emoji-more{opacity:.6;font-size:1rem;min-width:40px;min-height:40px;padding:0;
-  display:inline-flex;align-items:center;justify-content:center}
-.chat-emoji-more:hover{opacity:1}
-/* The composer foot sits at the BOTTOM of the chat page, so a picker anchored
-   top:100% opened off-screen underneath the bottom nav (z-index 100) and the
-   user saw nothing happen. Open upward, and clear the nav. */
-.chat-composer-foot .reaction-picker{top:auto;bottom:100%;margin:0 0 4px;z-index:150}
+/* UN-103: the emoji row (insert buttons + "more emoji" picker) is gone from
+   the composer foot entirely — Drew: players use their own keyboard's emoji.
+   What's left is just the char count. */
+.chat-composer-foot{display:flex;justify-content:flex-end;align-items:center;margin-top:4px}
 .chat-char-count{font-size:.65rem;color:#B02A37;font-weight:700}
 .chat-replying,.chat-target-note{font-size:.7rem;color:var(--text-secondary);background:var(--bg-card-alt);border-radius:8px;padding:4px 8px;margin-bottom:6px;display:flex;justify-content:space-between;gap:6px}
 .chat-replying button{background:none;border:none;cursor:pointer;font-size:.7rem}
@@ -1354,7 +1545,11 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-sheet-sub{font-size:.7rem;color:var(--text-muted)}
 .chat-sheet-header-actions{display:flex;gap:6px;align-items:center}
 .chat-sheet-close{background:var(--bg-input);border:none;border-radius:50%;width:30px;height:30px;cursor:pointer}
-.chat-sheet-scroll{flex:1;max-height:none;min-height:180px}
+/* v0.17.4: this inherited overflow-y from .chat-scroll. When that was removed,
+   sheet content spilled out of the sheet, unclipped and unscrollable, over the
+   composer and the backdrop. Declare it here so it never depends on a sibling
+   surface's rule again. max-height:none is correct — the flex parent bounds it. */
+.chat-sheet-scroll{flex:1;max-height:none;min-height:180px;overflow-y:auto;-webkit-overflow-scrolling:touch}
 
 /* Item F — game thread header colors, mirroring the dashboard's covering/
    trailing/won/lost palette for the CURRENT VIEWER's own pick. Applied to
@@ -1384,9 +1579,29 @@ label[for="week-show-history"],label:has(#week-show-history){
 
 
 /* ═══ v0.17.0 — one-room chat, notifications, identity ═══ */
-.chat-header-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+/* UN-104: this row used to pair with .section-header (20/12px padding + a
+   border, the same treatment every OTHER page's title gets) plus a second
+   "SCRIBE on duty" subtitle line beneath it — a two-line block competing with
+   the global maroon header right above it. It's ONE compact, quiet line now:
+   smaller type, tighter padding, no subtitle. It lives inside
+   .chat-sticky-stack below, so it docks with the pills/view-header as a unit. */
+.chat-header-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0 6px;border-bottom:1px solid var(--border)}
+.chat-header-row h2{font-size:1.05rem;color:var(--maroon);margin:0;display:flex;align-items:center;gap:8px}
 .chat-pending{font-size:.7rem}
-/* Retention notice (UN-8x) — below the pill row, above the message stream.
+/* UN-104: the compact header row + filter pills + optional per-game view
+   header dock TOGETHER as one unit at the top of the page.
+   UN-110 (batch 4): this used to stick beneath a runtime-measured
+   `.app-header` height via a CSS var (`--chat-sticky-top`, chat-ui.js
+   `_syncChatStickyMetrics`) — inert naming now removed. `.app-header` is
+   `display:none` on the chat tab entirely, and `.chat-sticky-stack` is just
+   an ordinary `flex:0 0 auto` item at the top of `#page-chat.active`'s flex
+   column (see that block, above) — flex order does the stacking, no offset
+   math needed. #page-chat ONLY: .page-wrapper/.main-content are shared by
+   every other tab. */
+#page-chat .chat-sticky-stack{background:var(--bg);padding-bottom:2px}
+/* Offline banner + retention notice render ABOVE the sticky stack in normal
+   flow (Drew's spec) — they push it down rather than floating separately.
+   Retention notice (UN-8x) — above the sticky stack, in normal flow.
    Uses the existing text-muted/text-xs utilities for color/size; this rule is
    spacing only, so it carries no theme risk (no hardcoded colors). */
 .chat-retention-notice{margin:2px 0 8px}
@@ -1416,6 +1631,14 @@ label[for="week-show-history"],label:has(#week-show-history){
 .chat-jump-latest{position:sticky;bottom:76px;margin-left:auto;display:block;
   background:var(--maroon);color:#fff;border:none;border-radius:999px;padding:6px 14px;
   font-size:.75rem;cursor:pointer;box-shadow:var(--shadow-btn)}
+/* UN-104 consequence (not itself in the design input, flagged in the
+   handoff): the composer is sticky now, so the flat 76px above no longer
+   clears it — this button would render UNDER the composer instead of above
+   it. Same measured-not-guessed approach as the header offset: chat-ui.js
+   measures the real composer height and publishes --chat-composer-h; the
+   fallback (90px) is a generous over-estimate on purpose, since sitting a
+   little high is a much safer failure mode than sitting under the composer. */
+#page-chat .chat-jump-latest{bottom:calc(var(--nav-height) + env(safe-area-inset-bottom, 0px) + var(--chat-composer-h,90px) + 10px);z-index:46}
 .chat-flash{animation:chatFlash 1.2s ease-out}
 @keyframes chatFlash{0%{background:var(--gold-pale)}100%{background:transparent}}
 .chat-load-older{display:block;margin:0 auto 10px;background:none;border:1px solid var(--border);
@@ -1442,14 +1665,24 @@ label[for="week-show-history"],label:has(#week-show-history){
   padding:3px 10px;font-size:.72rem;cursor:pointer}
 .chat-mention-opt:hover{border-color:var(--maroon);color:var(--maroon)}
 /* Toast */
-.chat-toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:1200;
+/* UN-99: same safe-area pattern as UN-98 so the floating chat toast clears
+   the camera housing / status bar on the installed app. */
+.chat-toast{position:fixed;top:calc(14px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);z-index:1200;
   display:flex;align-items:center;gap:10px;max-width:min(92vw,420px);
   background:var(--bg-card);border:1px solid var(--border-strong);border-radius:12px;
   padding:10px 14px;box-shadow:var(--shadow-card);cursor:pointer;animation:toastIn .25s ease-out}
 @keyframes toastIn{from{opacity:0;transform:translate(-50%,-8px)}to{opacity:1;transform:translate(-50%,0)}}
 .chat-toast-avatar{width:28px;height:28px;border-radius:50%;background:var(--maroon-pale);color:var(--maroon);
   display:inline-flex;align-items:center;justify-content:center;font-size:.7rem;font-weight:700;flex-shrink:0}
-.chat-toast-body{font-size:.78rem;line-height:1.3;overflow:hidden}
+.chat-toast-body{font-size:.78rem;line-height:1.3;overflow:hidden;flex:1;min-width:0}
+/* UN-102c: iMessage-style banners stay manually dismissible even when they
+   also time out (Drew: "needs to be able to be dismissed"). stopPropagation
+   on click (chat-ui.js) keeps this from also triggering the navigate-to-chat
+   behavior the rest of the toast has. CONVENTIONS #17 tap-target floor. */
+.chat-toast-dismiss{background:none;border:none;color:var(--text-muted);opacity:.7;cursor:pointer;
+  flex:0 0 auto;min-width:40px;min-height:40px;display:inline-flex;align-items:center;justify-content:center;
+  border-radius:50%;font-size:.85rem}
+.chat-toast-dismiss:hover{opacity:1;background:var(--bg-input)}
 /* Prefs */
 .chat-prefs .chat-prefs-row{display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border)}
 .chat-prefs .chat-prefs-row:last-child{border-bottom:none}

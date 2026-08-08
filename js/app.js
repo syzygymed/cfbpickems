@@ -4,8 +4,8 @@
  * One-stop place to update the user-visible version string + release date.
  * Surfaced in the footer of the Rules tab (Priority 12).
  */
-export const APP_VERSION = 'v0.17.3';
-export const APP_VERSION_DATE = '2026-08-07';
+export const APP_VERSION = 'v0.17.4';
+export const APP_VERSION_DATE = '2026-08-08';
 
 
 import {
@@ -88,6 +88,7 @@ import {
   emitPickRevealEvent, emitKickoffEvent, scribeLiveGameCheck,
   resumeChatAfterLogin,
   chatDigest,
+  setChatSyncStatus,
 } from './chat-ui.js';
 import { setPollMode, sendEvent as sendChatEvent, sendGameReact, getRetentionDays, retentionStats, isChatEnabled, refreshChatEnabled } from './chat.js';
 import { SEASON_2025, season2025Obligations, season2025Nets, ob2025Status } from './history-2025.js';
@@ -153,7 +154,7 @@ async function boot() {
     updateSyncBadge('syncing');
   }
 
-  setupNav(); refreshHeader(); renderTzToggle(); renderThemeToggle(); applyTheme(getTheme()); setupAutoRefresh();
+  setupNav(); setupHeaderIdentity(); refreshHeader(); renderTzToggle(); renderThemeToggle(); applyTheme(getTheme()); setupAutoRefresh();
   // Item A — independent of the score auto-refresh interval (which the
   // commissioner can set to "Off"), so the mid-session chat-off watch always
   // runs regardless of that other setting.
@@ -264,16 +265,33 @@ function revealApp() {
   requestAnimationFrame(() => document.body.classList.remove('cfbp-booting'));
 }
 
+// AD-06 (UN-110 consequence): .app-header — and with it #sync-badge — is
+// display:none on the chat tab. One function, two targets, so they cannot
+// drift (CONVENTIONS #21): every status update writes both. Chat's own badge
+// only surfaces text for 'error' (keeps chat chrome minimal in the normal
+// case) but the hard loud-fail rule still holds — sync failures are visible
+// on chat too, just quieter than the persistent red page banner.
 function updateSyncBadge(status) {
-  const el = document.getElementById('sync-badge');
-  if (!el) return;
   const map = {
     syncing: '☁️ Syncing…',
     synced:  '☁️ Synced',
     error:   '⚠️ Sync error',
   };
-  el.textContent = map[status] || '';
-  el.className = 'sync-badge sync-' + status;
+  const el = document.getElementById('sync-badge');
+  if (el) {
+    el.textContent = map[status] || '';
+    el.className = 'sync-badge sync-' + status;
+  }
+  // Track last-known status so a FRESH renderChatPage() — which replaces
+  // #page-chat's entire innerHTML, including any live badge node — reflects
+  // it immediately rather than waiting for the next onBackendStatus event.
+  setChatSyncStatus(status);
+  const chatEl = document.getElementById('chat-sync-badge');
+  if (chatEl) {
+    const isError = status === 'error';
+    chatEl.textContent = isError ? map.error : '';
+    chatEl.className = 'sync-badge' + (isError ? ' sync-error' : '');
+  }
 }
 
 function setupNav() {
@@ -336,6 +354,11 @@ function navigateTo(tab) {
     tab = 'dashboard';
   }
   state.currentTab = tab;
+  // UN-110: drives body[data-tab="..."] CSS (chat's own header-hidden layout,
+  // UN-111's tz/theme visibility). MUST come after the chat-disabled redirect
+  // above — otherwise a bounce to dashboard would leave the attribute reading
+  // "chat" and the header would stay hidden on the wrong page.
+  document.body.dataset.tab = tab;
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.querySelectorAll('.page-section').forEach(el => el.classList.toggle('active', el.id === `page-${tab}`));
   applyChatNavVisibility();
@@ -349,10 +372,56 @@ function navigateTo(tab) {
 function refreshHeader() {
   const week = getCurrentWeek();
   const el   = document.getElementById('header-meta');
+  renderHeaderIdentity();
   if (!el) return;
   el.innerHTML = week
     ? `<strong>${escHtml(formatWeekLabel(week))}</strong><span class="badge badge-${week.status} ml-sm">${week.status.toUpperCase()}</span>`
     : '<strong>CFB Pickems</strong>';
+}
+
+// ─── HEADER IDENTITY (UN-106) ─────────────────────────────────────────────────
+// One element serves both signed-in and signed-out states: an initials avatar
+// + first name when logged in, a "Sign In" pill when logged out. Renders
+// identically across every week status — it depends only on session/player
+// data, never on `week`. Both states tap through to the Picks tab, where
+// renderLoginScreen() and the existing logout control already live (no
+// duplicated auth logic in the header).
+//
+// getSession() is a synchronous device-local read (storage.js), so it never
+// itself needs "resolving" — but the PLAYER RECORD it points at can be
+// unhydrated for a moment on a fresh device (players route through the
+// backend mirror, session does not). If session.playerId is set but that
+// player can't be found yet, hold the slot EMPTY rather than guessing —
+// flashing "Sign In" for a frame before a real login resolves is worse than
+// showing nothing (batch 1 hazard). Call sites: refreshHeader() (boot, and
+// every subsequent re-render) and resyncPlayerPreferences() (login/logout/
+// player-switch) — the same two functions that already keep the rest of the
+// header in sync with session state.
+export function renderHeaderIdentity() {
+  const el = document.getElementById('header-identity');
+  if (!el) return;
+  const sess = getSession();
+  if (!sess?.playerId) {
+    el.hidden = false;
+    el.setAttribute('aria-label', 'Sign in');
+    el.innerHTML = `<span class="header-identity-pill">Sign In</span>`;
+    return;
+  }
+  const player = getPlayer(sess.playerId);
+  if (!player) {
+    el.hidden = true;
+    el.innerHTML = '';
+    return;
+  }
+  el.hidden = false;
+  el.setAttribute('aria-label', `Signed in as ${player.displayName}`);
+  el.innerHTML = `<span class="header-identity-avatar">${escHtml(getPlayerInitials(player))}</span><span class="header-identity-name">${escHtml(player.displayName)}</span>`;
+}
+
+/** One-time click binding — the header identity chip always routes to Picks,
+ *  logged in or out (UN-106). Bound once at boot alongside setupNav(). */
+function setupHeaderIdentity() {
+  document.getElementById('header-identity')?.addEventListener('click', () => navigateTo('picks'));
 }
 
 // ─── TIMEZONE TOGGLE ──────────────────────────────────────────────────────────
@@ -403,6 +472,7 @@ function resyncPlayerPreferences() {
   applyTheme(getTheme());
   renderTzToggle();
   renderThemeToggle();
+  renderHeaderIdentity();
 }
 
 function renderThemeToggle() {
@@ -628,10 +698,10 @@ function renderPicksPageCurrent() {
       <button class="btn btn-ghost btn-sm" id="logout-btn">Log Out</button>
     </div>
     ${state.editingPicks?'<div class="edit-mode-banner">✏️ You\'re updating picks you already submitted. Changes save when you click Submit again.</div>':''}
-    <div class="flex-between mb-sm randomize-row">
+    ${getSettings().randomizePicksEnabled?`<div class="flex-between mb-sm randomize-row">
       <span class="text-muted text-xs">Need a quick start? Randomize then edit anything you want to change.</span>
       <button class="btn btn-ghost btn-sm" id="randomize-picks-btn" title="Randomly pick a team for each game">🎲 Randomize My Picks</button>
-    </div>
+    </div>`:''}
     <div id="games-list"></div>
     ${renderTiebreakerInput(week)}
     ${renderExtraPointInput(week)}
@@ -1220,6 +1290,60 @@ function renderAlmaMaterWatch(weekId, games) {
   </div>`;
 }
 
+// ─── UN-105a: horizontal-scroll edge-fade cue ──────────────────────────────
+// ONE shared binder for every .dashboard-scroll / .batch-grid-scroll wrapper
+// in the app. Call initScrollFades(container) after ANY render that produces
+// one of those wrappers — see loadtest.mjs's site-count assertion, which
+// exists precisely so a future render site added without this call is caught.
+/** Test-only export: recompute (not (re)bind) the fade state for one element. */
+export function _updateScrollFadeState(el) {
+  if (!el) return;
+  const hasOverflow = el.scrollWidth > el.clientWidth + 1;
+  el.classList.toggle('scroll-fade-active', hasOverflow);
+  if (!hasOverflow) {
+    // No real overflow — never hint at a scroll that doesn't exist.
+    el.classList.remove('scroll-fade-at-end', 'scroll-fade-scrolled');
+    return;
+  }
+  el.classList.toggle('scroll-fade-scrolled', el.scrollLeft > 1);
+  el.classList.toggle('scroll-fade-at-end', el.scrollLeft + el.clientWidth >= el.scrollWidth - 1);
+}
+
+let _scrollFadeResizeBound = false;
+/**
+ * Bind (idempotently) the edge-fade cue to every .dashboard-scroll /
+ * .batch-grid-scroll wrapper inside `root` (defaults to the whole document).
+ * Safe — and necessary — to call repeatedly against the SAME DOM:
+ *  - a commissioner tab switch flips display:none without rebuilding the
+ *    DOM, so a wrapper that was hidden (0×0) at initial render needs a
+ *    re-measure once it becomes visible;
+ *  - a <details> section (the 2025 season record) starts collapsed, which is
+ *    also display:none — its two wrapped tables can't be measured until the
+ *    user actually opens it, so we bind a 'toggle' listener too.
+ * The per-element scroll listener itself is bound only once (dataset flag)
+ * so repeat calls never stack duplicate listeners on the same node.
+ */
+export function initScrollFades(root) {
+  const scope = root || document;
+  scope.querySelectorAll('.dashboard-scroll, .batch-grid-scroll').forEach(el => {
+    el.classList.add('scroll-fade');
+    if (!el.dataset.scrollFadeBound) {
+      el.dataset.scrollFadeBound = '1';
+      el.addEventListener('scroll', () => _updateScrollFadeState(el), { passive: true });
+    }
+    _updateScrollFadeState(el);
+  });
+  scope.querySelectorAll('details').forEach(d => {
+    if (d.dataset.scrollFadeToggleBound) return;
+    d.dataset.scrollFadeToggleBound = '1';
+    d.addEventListener('toggle', () => initScrollFades(d));
+  });
+  if (!_scrollFadeResizeBound && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    _scrollFadeResizeBound = true;
+    window.addEventListener('resize', () => initScrollFades(document));
+  }
+}
+
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
 function renderDashboard() {
@@ -1365,6 +1489,9 @@ function renderDashboardInner() {
   bindReactionHandlers(players); bindCommentBubbleHandlers();
   // Priority 7: column reorder (drag-and-drop) for both matrix and compact.
   bindColumnReorderHandlers();
+  // UN-105a — edge-fade cue for the standard-layout .dashboard-scroll wrapper
+  // (a no-op when compact layout is active, since there's nothing to find).
+  initScrollFades(c);
   document.getElementById('manual-refresh-btn')?.addEventListener('click',async()=>{
     showToast('🔄 Refreshing…','warning');
     await doRefreshScores(week,games); renderDashboard();
@@ -2106,6 +2233,11 @@ function renderLeaderboard() {
   `;
 
   bindSeason2025Sections(c);
+  // UN-105a — edge-fade cue for both season-summary/weekly-history
+  // .dashboard-scroll wrappers above AND the two nested inside the collapsed
+  // 2025 season <details> (initScrollFades binds a 'toggle' listener on the
+  // <details> itself, so those get measured once actually opened).
+  initScrollFades(c);
   c.querySelectorAll('.ob-action-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
       handleObligationAction(btn.dataset.obId, btn.dataset.obAction);
@@ -2643,6 +2775,24 @@ function renderCommPage() {
         </div>
       </div>`);
 
+    // Randomize Picks shortcut (UN-107) — default OFF (CONVENTIONS #10:
+    // existing settings blobs lack this field and must read as false, not
+    // truthy-by-accident). Same toggle-card pattern as Chat & S.C.R.I.B.E.
+    // above: title, checkbox row, state-dependent copy underneath.
+    sections.push(`
+      <div class="admin-section" data-comm-tab="settings">
+        <div class="card" id="comm-randomize-card">
+          <h3 style="color:var(--maroon)">🎲 Randomize Picks Shortcut</h3>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--border)">
+            <input type="checkbox" id="randomize-enabled-toggle" ${settings.randomizePicksEnabled ? 'checked' : ''} />
+            <span class="form-label" style="margin:0">Allow players to randomize their picks</span>
+          </label>
+          <p class="text-muted text-xs">${settings.randomizePicksEnabled
+            ? 'Players see a 🎲 Randomize My Picks shortcut on the Picks page.'
+            : 'The randomize shortcut is hidden. Players make every pick by hand.'}</p>
+        </div>
+      </div>`);
+
     // Rules
     sections.push(`
       <div class="admin-section" data-comm-tab="settings">
@@ -2813,7 +2963,7 @@ function renderCommPage() {
         </div>
       </div>`);
 
-    // Chat retention (UN-8x) — directly below Data Management, same tab (RG-10).
+    // Chat retention (UN-88) — directly below Data Management, same tab (RG-10).
     sections.push(`
       <div class="admin-section" data-comm-tab="data">
         <div class="admin-section-title">🙈 Chat Retention</div>
@@ -2835,6 +2985,11 @@ function renderCommPage() {
           b.classList.toggle('active', active);
           b.setAttribute('aria-selected', active);
         });
+        // UN-105a — the batch-grid-scroll (Demo Simulation, Week tab) was
+        // display:none (0×0) if the panel opened on a different tab; a tab
+        // switch doesn't rebuild the DOM, so re-measure now that it may have
+        // just become visible.
+        initScrollFades(c);
         // Scroll the panel to the top so users see the first section of the
         // new tab rather than a mid-scroll fragment.
         window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -2843,6 +2998,7 @@ function renderCommPage() {
     wireCollapsibleSections(c);
     bindCommEventListeners(week, games, availGames, suggested, settings, allWeeks);
     renderCommExtrasV16(week, games);   // v0.16.0 — Extra Point + Chat/SCRIBE admin
+    initScrollFades(c);   // UN-105a — batch-grid-scroll wrapper (Demo Simulation)
 
   } catch(err) {
     console.error('[renderCommPage] crash:', err);
@@ -3929,7 +4085,7 @@ function bindCommEventListeners(week, games, availGames, suggested, settings, al
     saveAllObligations(getObligations().filter(o=>!demoIds.has(o.weekId)));
     showToast('🧹 Demo obligations purged','success'); renderCommPage();
   });
-  // UN-8x debt-payment approval — one delegate per ledger shape, both driving
+  // UN-89 debt-payment approval — one delegate per ledger shape, both driving
   // the SAME state-machine helpers the Standings page uses (obligationRole /
   // obligationNextStatus in data-model.js), so the comm panel and Standings
   // can never disagree about a transition.
@@ -3946,7 +4102,7 @@ function bindCommEventListeners(week, games, availGames, suggested, settings, al
     });
   });
 
-  // Chat retention (UN-8x) — synced setting, OFF by default (CONVENTIONS #10).
+  // Chat retention (UN-88) — synced setting, OFF by default (CONVENTIONS #10).
   document.getElementById('chat-retention-toggle')?.addEventListener('change', e => {
     saveSetting('chatRetentionDays', e.target.checked ? 7 : 0);
     showToast(e.target.checked
@@ -3960,6 +4116,15 @@ function bindCommEventListeners(week, games, availGames, suggested, settings, al
     const val=parseInt(document.getElementById('auto-refresh-select')?.value||'60');
     saveSetting('autoRefreshInterval',val); setupAutoRefresh();
     showToast('Refresh interval saved','success');
+  });
+
+  // Randomize Picks shortcut (UN-107) — commissioner-controlled, default OFF.
+  document.getElementById('randomize-enabled-toggle')?.addEventListener('change', e => {
+    saveSetting('randomizePicksEnabled', e.target.checked);
+    showToast(e.target.checked
+      ? '🎲 Randomize shortcut enabled — players will see the button'
+      : '🎲 Randomize shortcut disabled — players make every pick by hand', 'success');
+    renderCommPage();
   });
 
   // Rules
@@ -4301,7 +4466,7 @@ function currentSeasonObligations() {
   return getObligations().filter(o=>!demoIds.has(o.weekId) && !String(o.obligationId).startsWith('ob_2025_'));
 }
 
-// ─── DEBT-PAYMENT APPROVAL (UN-8x) ─────────────────────────────────────────
+// ─── DEBT-PAYMENT APPROVAL (UN-89) ─────────────────────────────────────────
 // Badge + action markup shared by EVERY render path that shows an
 // obligation's payment status: the Standings weekly-history cell, the comm
 // Players-tab Obligations card, and both the current-season and 2K25-
@@ -4347,7 +4512,7 @@ function obligationActionsHTML(status, ob, sess, { payerName, recipientName, obC
   return badge + actions;
 }
 
-/** Applies one UN-8x transition to a CURRENT-SEASON obligation (a full
+/** Applies one UN-89 transition to a CURRENT-SEASON obligation (a full
  *  cfbp_obligations record). Re-derives role + the legal next status from the
  *  store rather than trusting the caller — the UI hides buttons a viewer
  *  shouldn't see, but a sufficiently motivated person could DOM one in, and
@@ -4561,7 +4726,7 @@ function renderSeason2025ObligationsAdmin() {
     }).join('');
 }
 
-/** Chat retention (UN-8x) — commissioner Data-tab card. CLIENT-SIDE HIDE ONLY,
+/** Chat retention (UN-88) — commissioner Data-tab card. CLIENT-SIDE HIDE ONLY,
  *  Drew's explicit call: the backend has no row-removal endpoint, so a real
  *  delete would need a new Code.gs endpoint + redeploy (RG-09 risk) for a
  *  cosmetic gain at 6-player scale. This toggle only stops old messages from

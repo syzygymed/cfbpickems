@@ -137,7 +137,7 @@ export const GAME_STATUS   = { SCHEDULED:'scheduled', LIVE:'live', FINAL:'final'
 export const PICK_RESULT   = { PENDING:'pending', LIVE:'live', WIN:'win', LOSS:'loss', NO_DECISION:'no_decision' };
 export const TIME_WINDOW   = { MORNING:'morning', AFTERNOON:'afternoon', EVENING:'evening', LATE:'late' };
 // v0.17.3 — PENDING added: a payer's own "Mark Paid" claim needs the creditor
-// (or the commissioner) to confirm before it counts as settled (UN-8x debt
+// (or the commissioner) to confirm before it counts as settled (UN-89 debt
 // approval). See obligationNextStatus() below for the transition rules.
 export const OBLIGATION_STATUS = { UNPAID:'unpaid', PENDING:'pending', PAID:'paid', WAIVED:'waived' };
 export const STORAGE_MODE  = { LOCAL:'local', GOOGLE_SHEETS:'googleSheets' };
@@ -174,9 +174,13 @@ export const DEFAULT_TZ = 'PT';
  * the bug, not a feature. data-model.js imports nothing, so it's the only
  * module either app.js or chat-ui.js can both pull from without a cycle.
  *
- * Order matters here: chat's QUICK_EMOJI derives from the FRONT of this list
- * (see chat-ui.js), so the most useful few are kept early. The dashboard's
- * reaction picker shows the whole list in a grid, where order is cosmetic.
+ * Order historically mattered because chat's QUICK_EMOJI derived from the
+ * FRONT of this list — retired in batch 2 (UN-103): the composer no longer
+ * inserts emoji at all, and the message-level always-visible subset was
+ * replaced by a single + that opens this full list per message. The front
+ * entries are still the most-used ones, so the order is left as-is for
+ * whoever next wants a curated subset. The dashboard's reaction picker shows
+ * the whole list in a grid, where order is purely cosmetic.
  */
 export const REACTION_PALETTE = [
   '👍', '👎', '🔥', '😂', '💀', '🍺',
@@ -250,7 +254,7 @@ export const DEFAULT_SETTINGS = {
   customRules: null,
   autoRefreshInterval: 60,
   timezone: DEFAULT_TZ,
-  // v0.17.3 — chat retention (UN-8x). 0/absent = OFF (default): the full
+  // v0.17.3 — chat retention (UN-88). 0/absent = OFF (default): the full
   // Locker Room history renders. A positive number is the render window in
   // days; older non-pinned messages stop RENDERING (nothing is deleted — see
   // chat.js isHiddenByRetention()). Default-when-missing story: old settings
@@ -264,6 +268,14 @@ export const DEFAULT_SETTINGS = {
   // device-local key (contrast with the teaser dismissal seq in chat-ui.js,
   // which IS device-local under AD-12).
   chatEnabled: true,
+  // UN-107 — commissioner control over the "Randomize My Picks" shortcut.
+  // Default FALSE, deliberately: this is the inverse of chatEnabled above.
+  // The button ships today as permanent/always-on; going forward it is
+  // opt-IN, so a missing value (every pre-existing settings blob) must read
+  // as OFF, not on (CONVENTIONS #10). Existing players lose the button until
+  // the Commissioner explicitly turns it on — that is the intended behavior
+  // change, not a bug.
+  randomizePicksEnabled: false,
 };
 
 // ─── DEMO PLAYERS — correct alma maters and 2-letter initials ─────────────────
@@ -808,7 +820,7 @@ export function teamAbbr(name) {
   return initials || words[0].slice(0, 4).toUpperCase();
 }
 
-// ─── DEBT-PAYMENT APPROVAL (UN-8x) ─────────────────────────────────────────
+// ─── DEBT-PAYMENT APPROVAL (UN-89) ─────────────────────────────────────────
 // One state machine, shared by BOTH the current-season obligation ledger
 // (`cfbp_obligations`, full records) and the 2K25 carryover ledger
 // (`settings.ob2025`, a status-map overlay on baked history — see
